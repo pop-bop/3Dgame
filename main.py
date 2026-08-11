@@ -179,10 +179,15 @@ while running:
     screen.blit(text_surface, (50, 50))
 
 
-    for i in cube:
+    for i in data:
+        v0, v1, v2 = i
 
-        if i[0] is not None:
-            pygame.draw.polygon(screen, "white", i[0])
+        points = project_to_screen_camera(np.array(v0), np.array(v1), np.array(v2),
+                                          640, 640,
+                                          camera_pos = camera_pos, camera_angles=(yaw, pitch, 0))
+
+        if points is not None:
+            pygame.draw.polygon(screen, (255, 255, 255), points)
 
     pygame.display.flip()
 
