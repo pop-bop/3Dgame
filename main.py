@@ -1,11 +1,13 @@
 import pygame
 import numpy as np
 import math
-import json
 
+S_WIDTH = 640
+S_HEIGHT = 640
+ASPECT_RATIO = S_HEIGHT / S_WIDTH
 
 pygame.init()
-screen = pygame.display.set_mode((640, 640))
+screen = pygame.display.set_mode((S_WIDTH, S_HEIGHT))
 clock = pygame.time.Clock()
 running = True
 
@@ -20,7 +22,7 @@ def compute_3d_vertex(v0, v1, v2,
                       target=(0.0, 0.0, 0.0),
                       up=(0.0, 1.0, 0.0),
                       fov_degrees=60.0,
-                      aspect_ratio=1.7778,
+                      aspect_ratio= ASPECT_RATIO,
                       near=0.1,
                       far=100.0):
 
@@ -168,6 +170,7 @@ while running:
         camera_pos[0] -= math.sin(math.radians(yaw - 90)) * vel
 
     mouse_x, mouse_y = pygame.mouse.get_pos()
+    pygame.mouse.set_visible(False)
 
     yaw = (mouse_x / 640) * 360.0
     pitch = (mouse_y / 640) * -360.0
@@ -183,7 +186,7 @@ while running:
         v0, v1, v2 = i
 
         points = project_to_screen_camera(np.array(v0), np.array(v1), np.array(v2),
-                                          640, 640,
+                                          S_WIDTH, S_HEIGHT,
                                           camera_pos = camera_pos, camera_angles=(yaw, pitch, 0))
 
         if points is not None:
