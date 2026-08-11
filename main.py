@@ -1,6 +1,7 @@
 import pygame
 import numpy as np
 import math
+import json
 
 S_WIDTH = 640
 S_HEIGHT = 640
@@ -11,11 +12,12 @@ screen = pygame.display.set_mode((S_WIDTH, S_HEIGHT))
 clock = pygame.time.Clock()
 running = True
 
-import json
-
-with open("cube.json", "r") as file:
-    data = json.load(file)
-    print(data)
+data = []
+obj_load = ["cube.json", "cylinder.json"]
+for obj in obj_load:
+    with open(obj, "r") as file:
+        data.append(json.load(file))
+print(data)
 
 def compute_3d_vertex(v0, v1, v2,
                       eye=(0.0, 0.0, 5.0),
@@ -181,16 +183,16 @@ while running:
 
     screen.blit(text_surface, (50, 50))
 
+    for obj in data:
+        for i in data[0]:
+            v0, v1, v2 = i
 
-    for i in data:
-        v0, v1, v2 = i
-
-        points = project_to_screen_camera(np.array(v0), np.array(v1), np.array(v2),
+            points = project_to_screen_camera(np.array(v0), np.array(v1), np.array(v2),
                                           S_WIDTH, S_HEIGHT,
                                           camera_pos = camera_pos, camera_angles=(yaw, pitch, 0))
 
-        if points is not None:
-            pygame.draw.polygon(screen, (255, 255, 255), points)
+            if points is not None:
+                pygame.draw.polygon(screen, (255, 255, 255), points)
 
     pygame.display.flip()
 
