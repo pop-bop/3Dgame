@@ -12,12 +12,27 @@ screen = pygame.display.set_mode((S_WIDTH, S_HEIGHT))
 clock = pygame.time.Clock()
 running = True
 
-data = []
-obj_load = ["cube.json", "cylinder.json"]
-for obj in obj_load:
-    with open(obj, "r") as file:
-        data.append(json.load(file))
-print(data)
+def load_obj(filename):
+    with open(filename, "r") as file:
+        return json.load(file)
+
+cube_mesh     = load_obj("cube.json")
+cylinder_mesh = load_obj("cylinder.json")
+
+positions = {
+    "cube":     [0.0, 0.0, 0.0],
+    "cylinder": [2.0, 0.0, 0.0],
+}
+
+meshes = {
+    "cube":     cube_mesh,
+    "cylinder": cylinder_mesh,
+}
+
+def get_world(name):
+    mesh = meshes[name]
+    pos  = positions[name]
+    return [[[v[0] + pos[0], v[1] + pos[1], v[2] + pos[2]] for v in tri] for tri in mesh]
 
 def compute_3d_vertex(v0, v1, v2,
                       eye=(0.0, 0.0, 5.0),
@@ -146,8 +161,10 @@ vel = 0.1
 
 my_font = pygame.font.SysFont(None, 48)
 
-
+x = 0
 while running:
+
+    x += 1
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -177,15 +194,15 @@ while running:
     yaw = (mouse_x / 640) * 360.0
     pitch = (mouse_y / 640) * -360.0
 
+    positions["cube"] = [0, 0.0, 0.0]
+
     text_surface = my_font.render(str(yaw), True, "white")
-
     screen.fill("black")
-
     screen.blit(text_surface, (50, 50))
 
-    for obj in data:
-        for i in data[0]:
-            v0, v1, v2 = i
+    for name in meshes:
+        for tri in get_world(name):
+            v0, v1, v2 = tri
 
             points = project_to_screen_camera(np.array(v0), np.array(v1), np.array(v2),
                                           S_WIDTH, S_HEIGHT,
