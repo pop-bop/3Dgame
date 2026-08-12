@@ -146,13 +146,6 @@ def build_view_matrix(eye, target, up):
     return mat_view
 
 
-# ── Clipping ─────────────────────────────────────────────────────────────────
-#
-# Vertices are numpy arrays that may carry extra data beyond [x, y, z, w].
-# For textured triangles we pack UVs as [x, y, z, w, u, v] so that the linear
-# interpolation done at clip boundaries also interpolates the texture coords —
-# this is what prevents the glitch when a face straddles the FOV edge.
-
 def _clip_axis(verts, axis, sign):
     def inside(v):
         return sign * v[axis] <= v[3]
@@ -161,7 +154,7 @@ def _clip_axis(verts, axis, sign):
         da = a[3] - sign * a[axis]
         db = b[3] - sign * b[axis]
         t  = da / (da - db)
-        return a + t * (b - a)   # works for any array length, including u,v
+        return a + t * (b - a)
 
     out = []
     n   = len(verts)
@@ -232,44 +225,58 @@ def camera_pose_from_angles(camera_pos, camera_angles):
     return eye, target, up
 
 
-# ── Texture drawing ───────────────────────────────────────────────────────────
-#
-# Uses getAffineTransform (3-point direct mapping) instead of the old
-# getPerspectiveTransform parallelogram trick — simpler and correct.
+def draw_textured_triangle(pygame_surface, texture, screen_pts, uvs, ws):
+    th, tw = texture.shape[:2]
+    p  = np.array(screen_pts, dtype=float)
+    uv = np.array(uvs,        dtype=float)
+    w  = np.array(ws,         dtype=float)
 
-def _warp_triangle(texture, src_uv_tri, dst_screen_tri, out_w, out_h):
-    h, w  = texture.shape[:2]
-    src   = np.float32([[u * w, v * h] for u, v in src_uv_tri])
-    dst   = np.float32(dst_screen_tri)
-
-    M = cv2.getAffineTransform(src, dst)
-
-    if _USE_CUDA:
-        gpu_src    = cv2.cuda_GpuMat()
-        gpu_src.upload(texture)
-        gpu_warped = cv2.cuda.warpAffine(gpu_src, M, (out_w, out_h),
-                                         flags=cv2.INTER_LINEAR,
-                                         borderMode=cv2.BORDER_CONSTANT,
-                                         borderValue=(0, 0, 0))
-        warped = gpu_warped.download()
-    else:
-        warped = cv2.warpAffine(texture, M, (out_w, out_h),
-                                flags=cv2.INTER_LINEAR,
-                                borderMode=cv2.BORDER_CONSTANT,
-                                borderValue=(0, 0, 0))
-
-    mask = np.zeros((out_h, out_w), dtype=np.uint8)
-    cv2.fillPoly(mask, np.int32([dst_screen_tri]), 255)
-    return warped, mask
+    # bounding box clamped to the screen
+    sw, sh = pygame_surface.get_width(), pygame_surface.get_height()
+    x0 = max(0,    int(np.floor(p[:, 0].min())))
+    x1 = min(sw-1, int(np.ceil (p[:, 0].max())))
+    y0 = max(0,    int(np.floor(p[:, 1].min())))
+    y1 = min(sh-1, int(np.ceil (p[:, 1].max())))
+    if x0 > x1 or y0 > y1:
+        return
 
 
-def _blit_onto_surface(pygame_surface, bgr_img, mask):
-    rgb_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-    px      = pygame.surfarray.pixels3d(pygame_surface)
-    mask_t  = mask.T
-    img_t   = np.transpose(rgb_img, (1, 0, 2))
-    px[mask_t == 255] = img_t[mask_t == 255]
-    del px
+    xs, ys = np.meshgrid(np.arange(x0, x1+1), np.arange(y0, y1+1))
+    px = xs.ravel().astype(float)
+    py = ys.ravel().astype(float)
+
+
+    denom = (p[1,1]-p[2,1])*(p[0,0]-p[2,0]) + (p[2,0]-p[1,0])*(p[0,1]-p[2,1])
+    if abs(denom) < 1e-10:
+        return
+    b0 = ((p[1,1]-p[2,1])*(px-p[2,0]) + (p[2,0]-p[1,0])*(py-p[2,1])) / denom
+    b1 = ((p[2,1]-p[0,1])*(px-p[2,0]) + (p[0,0]-p[2,0])*(py-p[2,1])) / denom
+    b2 = 1.0 - b0 - b1
+
+
+    inside = (b0 >= 0) & (b1 >= 0) & (b2 >= 0)
+    if not inside.any():
+        return
+    px = px[inside].astype(int)
+    py = py[inside].astype(int)
+    b0, b1, b2 = b0[inside], b1[inside], b2[inside]
+
+
+    inv_w = 1.0 / w
+    interp_inv_w = b0*inv_w[0] + b1*inv_w[1] + b2*inv_w[2]
+    u = (b0*uv[0,0]*inv_w[0] + b1*uv[1,0]*inv_w[1] + b2*uv[2,0]*inv_w[2]) / interp_inv_w
+    v = (b0*uv[0,1]*inv_w[0] + b1*uv[1,1]*inv_w[1] + b2*uv[2,1]*inv_w[2]) / interp_inv_w
+
+    tx = np.clip((u * tw).astype(int), 0, tw-1)
+    ty = np.clip((v * th).astype(int), 0, th-1)
+
+
+    bgr = texture[ty, tx]
+    rgb = bgr[:, ::-1]
+
+    screen_arr         = pygame.surfarray.pixels3d(pygame_surface)
+    screen_arr[px, py] = rgb
+    del screen_arr
 
 
 def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
@@ -314,17 +321,16 @@ def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
                     pa = clipped[0]
                     pb = clipped[i]
                     pc = clipped[i + 1]
-                    screen_pts = [to_pixel(pa, sw, sh),
-                                  to_pixel(pb, sw, sh),
-                                  to_pixel(pc, sw, sh)]
-                    # Read the interpolated UVs directly — no divide by w needed.
-                    # UVs are object-space attributes; dividing by clip-w would
-                    # scale them with depth, which causes textures to scroll as
-                    # the camera moves.
+                    screen_pts  = [to_pixel(pa, sw, sh),
+                                   to_pixel(pb, sw, sh),
+                                   to_pixel(pc, sw, sh)]
+                    # UVs and clip-space w values are passed to the rasteriser
+                    # so it can do perspective-correct interpolation per pixel.
                     clipped_uvs = [[pa[4], pa[5]],
                                    [pb[4], pb[5]],
                                    [pc[4], pc[5]]]
-                    draw_list.append((cam_z, screen_pts, texture, clipped_uvs, None))
+                    clipped_ws  = [pa[3], pb[3], pc[3]]
+                    draw_list.append((cam_z, screen_pts, texture, clipped_uvs, clipped_ws, None))
 
             else:
                 verts_4d = [np.dot(mat_vp, np.append(v, 1.0)) for v in (v0, v1, v2)]
@@ -337,14 +343,13 @@ def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
                     pts = [to_pixel(clipped[0],     sw, sh),
                            to_pixel(clipped[i],     sw, sh),
                            to_pixel(clipped[i + 1], sw, sh)]
-                    draw_list.append((cam_z, pts, None, None, color))
+                    draw_list.append((cam_z, pts, None, None, None, color))
 
     draw_list.sort(key=lambda x: x[0])
 
-    for cam_z, pts, texture, uv, color in draw_list:
+    for cam_z, pts, texture, uv, ws, color in draw_list:
         if texture is not None and uv is not None:
-            warped, mask = _warp_triangle(texture, uv, pts, sw, sh)
-            _blit_onto_surface(pygame_surface, warped, mask)
+            draw_textured_triangle(pygame_surface, texture, pts, uv, ws)
         else:
             pygame.draw.polygon(pygame_surface, color or (200, 200, 200), pts)
 
