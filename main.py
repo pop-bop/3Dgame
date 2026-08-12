@@ -38,15 +38,22 @@ def load_or_migrate(name):
 
 
 meshes = {
-    "cube":         load_or_migrate("cube"),
-    "cylinder":     load_or_migrate("cylinder"),
-    "concrete_box": load_or_migrate("concrete_box"),
+    "cube":         renderer.prepare_mesh(load_or_migrate("cube")),
+    "cylinder":     renderer.prepare_mesh(load_or_migrate("cylinder")),
+    "concrete_box": renderer.prepare_mesh(load_or_migrate("concrete_box")),
 }
 
 positions = {
     "cube":         [0.0,  0.0,  0.0],
     "cylinder":     [2.0,  0.0,  0.0],
     "concrete_box": [0.0,  0.0, -8.0],
+}
+
+# yaw, pitch, roll in degrees for each object
+rotations = {
+    "cube":         [0.0, 0.0, 0.0],
+    "cylinder":     [0.0, 0.0, 0.0],
+    "concrete_box": [0.0, 0.0, 0.0],
 }
 
 camera_pos = [0.0, 0.0, 5.0]
@@ -96,7 +103,8 @@ while running:
     screen.blit(my_font.render(f"yaw={yaw:.1f}", True, "white"), (50, 50))
 
     renderer.render_scene(screen, meshes, positions,
-                          camera_pos, (yaw, pitch, 0))
+                          camera_pos, (yaw, pitch, 0),
+                          rotations=rotations)
 
     pygame.display.flip()
     clock.tick(60)

@@ -101,6 +101,15 @@ def load_qwzx(path):
     return meshes
 
 
+def prepare_mesh(mesh):
+    """Call once after load_qwzx. Pre-converts geometry lists to numpy arrays
+    so render_scene can transform all vertices with a single matrix multiply
+    instead of a Python loop over every triangle."""
+    mesh["verts"]  = np.array(mesh["tris"], dtype=np.float32)  # (N, 3, 3)
+    mesh["uv_arr"] = np.array(mesh["uvs"],  dtype=np.float32) if mesh["uvs"] else None  # (N, 3, 2)
+    return mesh
+
+
 def build_vp_matrix(eye, target, up, fov_degrees, aspect_ratio, near, far):
     f = target - eye
     f = f / np.linalg.norm(f)
@@ -205,6 +214,20 @@ def to_pixel(clip_vert, screen_width, screen_height):
     return (x, y)
 
 
+def rotation_matrix(angles):
+    yaw, pitch, roll = (np.radians(a % 360.0) for a in angles)
+
+    cy, sy = np.cos(yaw),   np.sin(yaw)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cr, sr = np.cos(roll),  np.sin(roll)
+
+    R_yaw   = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    R_pitch = np.array([[1, 0, 0],   [0, cp, -sp], [0, sp, cp]])
+    R_roll  = np.array([[cr, -sr, 0],[sr, cr,  0], [0,  0,  1]])
+
+    return R_yaw @ R_pitch @ R_roll
+
+
 def camera_pose_from_angles(camera_pos, camera_angles):
     yaw, pitch, roll = (np.radians(a % 360.0) for a in camera_angles)
 
@@ -225,14 +248,14 @@ def camera_pose_from_angles(camera_pos, camera_angles):
     return eye, target, up
 
 
-def draw_textured_triangle(pygame_surface, texture, screen_pts, uvs, ws):
-    th, tw = texture.shape[:2]
-    p  = np.array(screen_pts, dtype=float)
-    uv = np.array(uvs,        dtype=float)
-    w  = np.array(ws,         dtype=float)
+def draw_textured_triangle(screen_arr, texture, screen_pts, uvs, ws):
 
-    # bounding box clamped to the screen
-    sw, sh = pygame_surface.get_width(), pygame_surface.get_height()
+    th, tw = texture.shape[:2]
+    sw, sh = screen_arr.shape[0], screen_arr.shape[1]
+    p  = np.array(screen_pts, dtype=np.float32)
+    uv = np.array(uvs,        dtype=np.float32)
+    w  = np.array(ws,         dtype=np.float32)
+
     x0 = max(0,    int(np.floor(p[:, 0].min())))
     x1 = min(sw-1, int(np.ceil (p[:, 0].max())))
     y0 = max(0,    int(np.floor(p[:, 1].min())))
@@ -241,10 +264,10 @@ def draw_textured_triangle(pygame_surface, texture, screen_pts, uvs, ws):
         return
 
 
-    xs, ys = np.meshgrid(np.arange(x0, x1+1), np.arange(y0, y1+1))
-    px = xs.ravel().astype(float)
-    py = ys.ravel().astype(float)
-
+    xs, ys = np.meshgrid(np.arange(x0, x1+1, dtype=np.float32),
+                         np.arange(y0, y1+1, dtype=np.float32))
+    px = xs.ravel()
+    py = ys.ravel()
 
     denom = (p[1,1]-p[2,1])*(p[0,0]-p[2,0]) + (p[2,0]-p[1,0])*(p[0,1]-p[2,1])
     if abs(denom) < 1e-10:
@@ -253,34 +276,28 @@ def draw_textured_triangle(pygame_surface, texture, screen_pts, uvs, ws):
     b1 = ((p[2,1]-p[0,1])*(px-p[2,0]) + (p[0,0]-p[2,0])*(py-p[2,1])) / denom
     b2 = 1.0 - b0 - b1
 
-
     inside = (b0 >= 0) & (b1 >= 0) & (b2 >= 0)
     if not inside.any():
         return
-    px = px[inside].astype(int)
-    py = py[inside].astype(int)
+    px = px[inside].astype(np.int32)
+    py = py[inside].astype(np.int32)
     b0, b1, b2 = b0[inside], b1[inside], b2[inside]
 
-
-    inv_w = 1.0 / w
+    # perspective-correct UV interpolation
+    inv_w        = 1.0 / w
     interp_inv_w = b0*inv_w[0] + b1*inv_w[1] + b2*inv_w[2]
     u = (b0*uv[0,0]*inv_w[0] + b1*uv[1,0]*inv_w[1] + b2*uv[2,0]*inv_w[2]) / interp_inv_w
     v = (b0*uv[0,1]*inv_w[0] + b1*uv[1,1]*inv_w[1] + b2*uv[2,1]*inv_w[2]) / interp_inv_w
 
-    tx = np.clip((u * tw).astype(int), 0, tw-1)
-    ty = np.clip((v * th).astype(int), 0, th-1)
-
+    tx = np.clip((u * tw).astype(np.int32), 0, tw-1)
+    ty = np.clip((v * th).astype(np.int32), 0, th-1)
 
     bgr = texture[ty, tx]
-    rgb = bgr[:, ::-1]
-
-    screen_arr         = pygame.surfarray.pixels3d(pygame_surface)
-    screen_arr[px, py] = rgb
-    del screen_arr
+    screen_arr[px, py] = bgr[:, ::-1]   # BGR → RGB
 
 
 def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
-                 fov_degrees=60.0, near=0.1, far=100.0):
+                 rotations=None, fov_degrees=60.0, near=0.1, far=100.0):
     sw = pygame_surface.get_width()
     sh = pygame_surface.get_height()
     aspect = sh / sw
@@ -292,52 +309,64 @@ def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
     draw_list = []
 
     for name, mesh in meshes.items():
-        pos     = positions.get(name, [0.0, 0.0, 0.0])
-        tris    = mesh["tris"]
+        pos     = np.array(positions.get(name, [0.0, 0.0, 0.0]), dtype=np.float32)
+        rot     = rotations.get(name, [0.0, 0.0, 0.0]) if rotations else [0.0, 0.0, 0.0]
+        R       = rotation_matrix(rot).astype(np.float32)
         texture = mesh.get("texture")
         uvs     = mesh.get("uvs")
         colors  = mesh.get("colors")
 
-        for idx, tri in enumerate(tris):
-            v0 = np.array([tri[0][0]+pos[0], tri[0][1]+pos[1], tri[0][2]+pos[2]])
-            v1 = np.array([tri[1][0]+pos[0], tri[1][1]+pos[1], tri[1][2]+pos[2]])
-            v2 = np.array([tri[2][0]+pos[0], tri[2][1]+pos[1], tri[2][2]+pos[2]])
 
-            centroid_world = (v0 + v1 + v2) / 3.0
-            cam_z = (mat_view @ np.append(centroid_world, 1.0))[2]
+        if "verts" in mesh:
+            verts = mesh["verts"]
+            uv_arr = mesh.get("uv_arr")
+        else:
+            verts  = np.array(mesh["tris"], dtype=np.float32)
+            uv_arr = np.array(uvs, dtype=np.float32) if uvs else None
 
-            if texture is not None and uvs is not None:
-                # Pack UVs into the clip vector as [x, y, z, w, u, v] so the
-                # clipper linearly interpolates UVs at every boundary it creates.
-                uv = uvs[idx]
-                c0 = np.append(np.dot(mat_vp, np.append(v0, 1.0)), uv[0])
-                c1 = np.append(np.dot(mat_vp, np.append(v1, 1.0)), uv[1])
-                c2 = np.append(np.dot(mat_vp, np.append(v2, 1.0)), uv[2])
-                clipped = clip_to_frustum([c0, c1, c2], near)
+        N = verts.shape[0]
+
+
+        flat  = verts.reshape(-1, 3)
+        world = flat @ R.T + pos
+
+        ones  = np.ones((N * 3, 1), dtype=np.float32)
+        hom   = np.concatenate([world, ones], axis=1)
+        clip  = (mat_vp @ hom.T).T
+
+        clip  = clip.reshape(N, 3, 4)
+        world = world.reshape(N, 3, 3)
+
+        centroids_w = world.mean(axis=1)
+        ones_n      = np.ones((N, 1), dtype=np.float32)
+        centroids_h = np.concatenate([centroids_w, ones_n], axis=1)
+        cam_zs      = (mat_view @ centroids_h.T)[2]
+
+
+        for idx in range(N):
+            cam_z = float(cam_zs[idx])
+
+            if texture is not None and uv_arr is not None:
+                uv = uv_arr[idx]
+
+                cv = clip[idx]
+                c_verts = [np.append(cv[j], uv[j]) for j in range(3)]
+                clipped = clip_to_frustum(c_verts, near)
                 if len(clipped) < 3:
                     continue
-
                 for i in range(1, len(clipped) - 1):
-                    pa = clipped[0]
-                    pb = clipped[i]
-                    pc = clipped[i + 1]
-                    screen_pts  = [to_pixel(pa, sw, sh),
-                                   to_pixel(pb, sw, sh),
-                                   to_pixel(pc, sw, sh)]
-                    # UVs and clip-space w values are passed to the rasteriser
-                    # so it can do perspective-correct interpolation per pixel.
-                    clipped_uvs = [[pa[4], pa[5]],
-                                   [pb[4], pb[5]],
-                                   [pc[4], pc[5]]]
-                    clipped_ws  = [pa[3], pb[3], pc[3]]
-                    draw_list.append((cam_z, screen_pts, texture, clipped_uvs, clipped_ws, None))
+                    pa, pb, pc = clipped[0], clipped[i], clipped[i+1]
+                    pts     = [to_pixel(pa, sw, sh), to_pixel(pb, sw, sh), to_pixel(pc, sw, sh)]
+                    tri_uvs = [[pa[4], pa[5]], [pb[4], pb[5]], [pc[4], pc[5]]]
+                    tri_ws  = [pa[3], pb[3], pc[3]]
+                    draw_list.append((cam_z, pts, texture, tri_uvs, tri_ws, None))
 
             else:
-                verts_4d = [np.dot(mat_vp, np.append(v, 1.0)) for v in (v0, v1, v2)]
-                clipped  = clip_to_frustum(verts_4d, near)
+                cv      = clip[idx]
+                c_verts = [cv[j] for j in range(3)]
+                clipped = clip_to_frustum(c_verts, near)
                 if len(clipped) < 3:
                     continue
-
                 color = colors[idx] if colors else None
                 for i in range(1, len(clipped) - 1):
                     pts = [to_pixel(clipped[0],     sw, sh),
@@ -347,10 +376,15 @@ def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
 
     draw_list.sort(key=lambda x: x[0])
 
+
+    screen_arr = pygame.surfarray.pixels3d(pygame_surface)
     for cam_z, pts, texture, uv, ws, color in draw_list:
         if texture is not None and uv is not None:
-            draw_textured_triangle(pygame_surface, texture, pts, uv, ws)
+            draw_textured_triangle(screen_arr, texture, pts, uv, ws)
         else:
+            del screen_arr
             pygame.draw.polygon(pygame_surface, color or (200, 200, 200), pts)
+            screen_arr = pygame.surfarray.pixels3d(pygame_surface)
+    del screen_arr
 
 
