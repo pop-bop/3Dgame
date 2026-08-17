@@ -249,11 +249,7 @@ def camera_pose_from_angles(camera_pos, camera_angles):
 
 
 def draw_textured_triangle(screen_arr, zbuf, texture, screen_pts, uvs, ws, zs):
-    """Rasterize a textured triangle with perspective-correct UVs and depth testing.
 
-    zs : NDC z per vertex (clip_z / clip_w).  Smaller value = closer to camera.
-    zbuf : (sw, sh) float32 array; pixel written only when depth < current entry.
-    """
     th, tw = texture.shape[:2]
     sw, sh = screen_arr.shape[0], screen_arr.shape[1]
     p  = np.array(screen_pts, dtype=np.float32)
@@ -287,7 +283,6 @@ def draw_textured_triangle(screen_arr, zbuf, texture, screen_pts, uvs, ws, zs):
     py = py[inside].astype(np.int32)
     b0, b1, b2 = b0[inside], b1[inside], b2[inside]
 
-    # Depth test — linear interpolation of NDC z (sufficient for non-degenerate geo)
     depth   = b0*z[0] + b1*z[1] + b2*z[2]
     visible = depth < zbuf[px, py]
     if not visible.any():
@@ -310,13 +305,7 @@ def draw_textured_triangle(screen_arr, zbuf, texture, screen_pts, uvs, ws, zs):
 
 
 def draw_flat_triangle(screen_arr, zbuf, screen_pts, zs, color):
-    """Rasterize a flat-shaded triangle with depth testing.
 
-    Mirrors draw_textured_triangle but writes a single colour per pixel instead
-    of sampling a texture.  Using the same rasterizer for both triangle types
-    means the z-buffer is shared and painter's-algorithm sorting order no longer
-    matters for correctness.
-    """
     sw, sh = screen_arr.shape[0], screen_arr.shape[1]
     p = np.array(screen_pts, dtype=np.float32)
     z = np.array(zs,         dtype=np.float32)
@@ -355,7 +344,7 @@ def draw_flat_triangle(screen_arr, zbuf, screen_pts, zs, color):
     px, py = px[visible], py[visible]
     zbuf[px, py] = depth[visible]
 
-    # Write colour (convert RGB → BGR to match surfarray layout)
+
     screen_arr[px, py] = np.array(color, dtype=np.uint8)[::-1]
 
 
@@ -369,12 +358,10 @@ def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
     mat_view = build_view_matrix(eye, target, up)
     mat_vp   = build_vp_matrix(eye, target, up, fov_degrees, aspect, near, far)
 
-    # Z-buffer: one depth value per pixel, initialised to +∞ (nothing drawn yet).
-    # NDC z ranges from -1 (near) to +1 (far), so any real triangle will be closer.
+
     zbuf = np.full((sw, sh), np.inf, dtype=np.float32)
 
-    # draw_list entries: (ndc_z_centroid, pts, texture, uvs, ws, ndc_zs, color)
-    # ndc_z_centroid is kept only for the sort; per-pixel depth comes from ndc_zs.
+
     draw_list = []
 
     for name, mesh in meshes.items():
@@ -464,7 +451,7 @@ def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
                                pc[2]/max(pc[3], 1e-6)]
                     draw_list.append((sort_z, pts, None, None, None, tri_zs, color))
 
-    # Painter's sort is now only a hint — the z-buffer handles correctness.
+
     draw_list.sort(key=lambda x: x[0])
 
     screen_arr = pygame.surfarray.pixels3d(pygame_surface)
@@ -478,11 +465,7 @@ def render_scene(pygame_surface, meshes, positions, camera_pos, camera_angles,
 
 def draw_aabb_debug(pygame_surface, mn, mx, camera_pos, camera_angles,
                     color=(0, 255, 0), fov_degrees=60.0, near=0.1, far=100.0):
-    """
-    Project the 12 edges of an AABB into screen space and draw them as lines.
-    mn, mx : array-like (3,) — world-space min/max corners.
-    color  : RGB tuple.
-    """
+
     sw = pygame_surface.get_width()
     sh = pygame_surface.get_height()
     aspect = sh / sw

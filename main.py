@@ -113,14 +113,12 @@ pitch     = 0.0
 SENS      = 0.15
 
 
-# ── main loop ─────────────────────────────────────────────────────────────────
-
 running = True
 
 while running:
     dt = clock.tick(60) / 1000.0
 
-    # ── event loop — accumulate mouse deltas, handle keys ────────────────────
+
     mouse_dx = 0
     mouse_dy = 0
 
@@ -130,7 +128,7 @@ while running:
 
         elif event.type == pygame.MOUSEMOTION:
             if _skip_warp:
-                # discard the synthetic event fired by set_pos below
+
                 _skip_warp = False
                 continue
             mouse_dx += event.rel[0]
@@ -147,7 +145,7 @@ while running:
             elif event.key == pygame.K_6:
                 fly_mode                     = not fly_mode
                 physics.player["fly_mode"]   = fly_mode
-                physics.player["vel"][1]     = 0.0   # kill vertical momentum on toggle
+                physics.player["vel"][1]     = 0.0
 
 
     pygame.mouse.set_pos(_CX, _CY)
@@ -161,7 +159,7 @@ while running:
     rad   = math.radians(yaw)
     fwd_x = -math.sin(rad)
     fwd_z = -math.cos(rad)
-    str_x =  fwd_z          # right strafe = rotated 90°
+    str_x =  fwd_z
     str_z = -fwd_x
 
     keys  = pygame.key.get_pressed()
