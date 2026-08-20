@@ -1,0 +1,8 @@
+{
+  "player_start": [0.0, 2.0, 5.0],
+  "objects": [
+    { "mesh": "cube",         "pos": [0.0,  0.0,  0.0], "rot": [0, 0, 0] },
+    { "mesh": "cylinder",     "pos": [2.0,  0.0,  0.0], "rot": [0, 0, 0] },
+    { "mesh": "concrete_box", "pos": [0.0,  0.0, -8.0], "rot": [0, 0, 0] }
+  ]
+}
