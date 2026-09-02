@@ -186,11 +186,13 @@ while running:
              f"  pos=({p[0]:.1f},{p[1]:.1f},{p[2]:.1f})")
     line2 = "  ".join(flags) if flags else ""
     line3 = "4=hitbox  5=noclip  6=fly"
+    line4 = str(clock)
 
     screen.blit(my_font.render(line1, True, hud_col),  (6, 6))
     if line2:
         screen.blit(my_font.render(line2, True, flag_col), (6, 22))
     screen.blit(my_font.render(line3, True, hint_col), (6, 38))
+    screen.blit(my_font.render(line4, True, hint_col), (6, 62))
 
     pygame.display.flip()
 
