@@ -91,6 +91,7 @@ flag_col = (255, 220, 60)
 debug_hitboxes = False
 no_collision   = False
 fly_mode       = False
+gpu_mode       = True
 
 yaw   = 0.0
 pitch = 0.0
@@ -127,6 +128,9 @@ while running:
                 fly_mode                   = not fly_mode
                 physics.player["fly_mode"] = fly_mode
                 physics.player["vel"][1]   = 0.0
+            elif event.key == pygame.K_7:
+                gpu_mode = not gpu_mode
+                renderer.set_gpu_acceleration(gpu_mode)
 
     pygame.mouse.set_pos(_CX, _CY)
     _skip_warp = True
@@ -176,7 +180,7 @@ while running:
                                      camera_pos, camera_angles,
                                      color=(64, 128, 255))
 
-    flags = []
+    flags = [f"RENDERER: {'GPU (RX 7900 XTX)' if gpu_mode else 'CPU (Software)'}"]
     if debug_hitboxes: flags.append("HITBOX")
     if no_collision:   flags.append("NOCLIP")
     if fly_mode:       flags.append("FLY")
@@ -185,7 +189,7 @@ while running:
     line1 = (f"yaw={yaw:6.1f}  pitch={pitch:6.1f}"
              f"  pos=({p[0]:.1f},{p[1]:.1f},{p[2]:.1f})")
     line2 = "  ".join(flags) if flags else ""
-    line3 = "4=hitbox  5=noclip  6=fly"
+    line3 = "4=hitbox  5=noclip  6=fly  7=toggle GPU/CPU"
     line4 = str(clock)
 
     screen.blit(my_font.render(line1, True, hud_col),  (6, 6))
