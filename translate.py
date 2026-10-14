@@ -141,7 +141,8 @@ def main():
     if len(sys.argv) >= 3:
         qwzx_path = sys.argv[2]
     else:
-        qwzx_path = os.path.splitext(obj_path)[0] + ".qwzx"
+        out_dir = "assets" if os.path.exists("assets") else "."
+        qwzx_path = os.path.join(out_dir, os.path.splitext(os.path.basename(obj_path))[0] + ".qwzx")
 
     print(f"Parsing {obj_path} ...")
     meshes = parse_obj(obj_path)

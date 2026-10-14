@@ -32,14 +32,28 @@ def _json_to_mesh(json_path):
             "texture": None, "uvs": None}
 
 
+ASSETS_DIR  = os.path.join(ROOT, "assets")
+PHYSICS_DIR = os.path.join(ROOT, "physics")
+
+
 def load_or_migrate(name):
-    qwzx_path = os.path.join(ROOT, f"{name}.qwzx")
-    json_path  = os.path.join(ROOT, f"{name}.json")
+    qwzx_path = os.path.join(ASSETS_DIR, f"{name}.qwzx")
+    if not os.path.exists(qwzx_path):
+        root_qwzx = os.path.join(ROOT, f"{name}.qwzx")
+        if os.path.exists(root_qwzx):
+            qwzx_path = root_qwzx
+
+    json_path = os.path.join(ASSETS_DIR, f"{name}.json")
+    if not os.path.exists(json_path):
+        json_path = os.path.join(ROOT, f"{name}.json")
+
     if os.path.exists(qwzx_path):
         return renderer.load_qwzx(qwzx_path)[0]
     if os.path.exists(json_path):
         mesh = _json_to_mesh(json_path)
-        renderer.save_qwzx(qwzx_path, [mesh])
+        os.makedirs(ASSETS_DIR, exist_ok=True)
+        save_path = os.path.join(ASSETS_DIR, f"{name}.qwzx")
+        renderer.save_qwzx(save_path, [mesh])
         return mesh
     raise FileNotFoundError(f"Neither {qwzx_path} nor {json_path} found")
 

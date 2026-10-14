@@ -81,7 +81,17 @@ def load_rigid_body_props(file_path_or_dict, root="."):
     if isinstance(file_path_or_dict, dict):
         raw = file_path_or_dict
     elif isinstance(file_path_or_dict, str):
+        physics_dir = os.path.join(root, "physics")
+        basename = os.path.basename(file_path_or_dict)
+        name_no_ext = os.path.splitext(basename)[0]
+
         candidates = [
+            os.path.join(physics_dir, file_path_or_dict),
+            os.path.join(physics_dir, basename),
+            os.path.join(physics_dir, f"{basename}.json"),
+            os.path.join(physics_dir, f"{name_no_ext}.json"),
+            os.path.join(physics_dir, f"{name_no_ext}.physics.json"),
+            os.path.join(physics_dir, f"{name_no_ext}_physics.json"),
             file_path_or_dict,
             os.path.join(root, file_path_or_dict),
             os.path.join(root, f"{file_path_or_dict}.json"),
