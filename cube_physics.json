@@ -1,0 +1,11 @@
+{
+  "mass": 200.0,
+  "init vel": [0.0, 2.0, -1.0],
+  "angular velocity": [0.5, 1.5, 0.0],
+  "frictional coefficient": 0.3,
+  "static_friction": 0.6,
+  "dynamic_friction": 0.5,
+  "air friction coefficient": 0.1,
+  "angular drag coefficient": 0.1,
+  "restitution": 0.7
+}

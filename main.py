@@ -48,10 +48,11 @@ def load_map(path):
     with open(path) as f:
         data = json.load(f)
 
-    base_meshes = {}
-    meshes      = {}
-    positions   = {}
-    rotations   = {}
+    base_meshes  = {}
+    meshes       = {}
+    positions    = {}
+    rotations    = {}
+    objects_meta = {}
 
     for i, obj in enumerate(data["objects"]):
         mesh_name = obj["mesh"]
@@ -60,19 +61,31 @@ def load_map(path):
         if mesh_name not in base_meshes:
             base_meshes[mesh_name] = renderer.prepare_mesh(load_or_migrate(mesh_name))
 
-        meshes[key]    = base_meshes[mesh_name]
-        positions[key] = obj["pos"]
-        rotations[key] = obj.get("rot", [0, 0, 0])
+        meshes[key]       = base_meshes[mesh_name]
+        positions[key]    = obj["pos"]
+        rotations[key]    = obj.get("rot", [0, 0, 0])
+        objects_meta[key] = obj
 
-    return meshes, positions, rotations, data["player_start"]
+    return meshes, positions, rotations, data["player_start"], objects_meta
 
 
-meshes, positions, rotations, player_start = load_map(os.path.join(ROOT, "map.json"))
+meshes, positions, rotations, player_start, objects_meta = load_map(os.path.join(ROOT, "map.json"))
 
 physics.add_static("ground", [-500, -0.2, -500], [500, 0.0, 500])
 
 for key, mesh in meshes.items():
-    physics.add_mesh_static(key, mesh, positions[key], rotations[key])
+    obj_info = objects_meta.get(key, {})
+    is_rigid = obj_info.get("rigid_body", False)
+    if is_rigid:
+        physics_file = (
+            obj_info.get("physics_file") or
+            obj_info.get("physics") or
+            obj_info.get("physics_json") or
+            f"{obj_info.get('mesh')}.physics.json"
+        )
+        physics.add_rigid_body(key, mesh, positions[key], rotations[key], physics_file=physics_file, root=ROOT)
+    else:
+        physics.add_mesh_static(key, mesh, positions[key], rotations[key])
 
 physics.player["pos"][:] = player_start
 
@@ -97,6 +110,9 @@ yaw   = 0.0
 pitch = 0.0
 SENS  = 0.15
 
+held_body = None
+hold_distance = 2.2
+
 running = True
 
 while running:
@@ -104,6 +120,14 @@ while running:
 
     mouse_dx = 0
     mouse_dy = 0
+
+    camera_pos    = physics.player_camera_pos()
+    camera_angles = (yaw, pitch, 0)
+    cam_eye, cam_target, _ = renderer.camera_pose_from_angles(camera_pos, camera_angles)
+    cam_fwd = cam_target - cam_eye
+    fwd_norm = np.linalg.norm(cam_fwd)
+    if fwd_norm > 1e-6:
+        cam_fwd = cam_fwd / fwd_norm
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -116,9 +140,30 @@ while running:
             mouse_dx += event.rel[0]
             mouse_dy += event.rel[1]
 
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                if held_body is not None:
+                    physics.throw_held_object(held_body, cam_fwd, physics.player["vel"], throw_speed=18.0)
+                    held_body = None
+                else:
+                    for body in physics.rigid_bodies.values():
+                        dist = np.linalg.norm(body.get_center() - np.array(camera_pos))
+                        if dist < 12.0:
+                            body.velocity += cam_fwd * 6.0
+                            body.angular_velocity += np.array([0.5, 1.2, -0.3])
+
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 running = False
+            elif event.key == pygame.K_e:
+                if held_body is not None:
+                    physics.drop_held_object(held_body, physics.player["vel"])
+                    held_body = None
+                else:
+                    target = physics.find_targeted_body(cam_eye, cam_fwd, max_dist=4.5)
+                    if target is not None:
+                        held_body = target
+                        hold_distance = float(np.clip(np.linalg.norm(target.get_center() - cam_eye), 1.8, 2.6))
             elif event.key == pygame.K_4:
                 debug_hitboxes = not debug_hitboxes
             elif event.key == pygame.K_5:
@@ -159,7 +204,17 @@ while running:
         elif keys[pygame.K_LSHIFT]: physics.player["vel"][1] = -physics.FLY_SPEED
         else:                       physics.player["vel"][1] =  0.0
 
+    if held_body is not None:
+        target_pos = cam_eye + cam_fwd * hold_distance
+        if not physics.update_held_object(held_body, target_pos, dt):
+            held_body = None
+
     physics.move_player(wx, wz, jump, dt)
+    physics.update_rigid_bodies(dt)
+
+    for key, body in physics.rigid_bodies.items():
+        positions[key] = body.position.tolist()
+        rotations[key] = body.get_rotation_euler()
 
     camera_pos    = physics.player_camera_pos()
     camera_angles = (yaw, pitch, 0)
@@ -170,15 +225,36 @@ while running:
                           camera_pos, camera_angles,
                           rotations=rotations)
 
+    # Crosshair
+    ch_col = (180, 180, 180)
+    pygame.draw.line(screen, ch_col, (_CX - 4, _CY), (_CX + 4, _CY), 1)
+    pygame.draw.line(screen, ch_col, (_CX, _CY - 4), (_CX, _CY + 4), 1)
+
+    # Pickup interaction HUD prompt
+    aimed_body = None if held_body is not None else physics.find_targeted_body(cam_eye, cam_fwd, max_dist=4.5)
+    if held_body is not None:
+        prompt_surf = my_font.render("[E] Drop   [LMB] Throw", True, flag_col)
+        screen.blit(prompt_surf, (_CX - prompt_surf.get_width() // 2, _CY + 20))
+    elif aimed_body is not None:
+        prompt_surf = my_font.render("[E] Pick up", True, flag_col)
+        screen.blit(prompt_surf, (_CX - prompt_surf.get_width() // 2, _CY + 20))
+
     if debug_hitboxes:
         pmn, pmx = physics.player_aabb()
         renderer.draw_aabb_debug(screen, pmn, pmx,
                                  camera_pos, camera_angles,
                                  color=(0, 255, 0))
-        for key, (mn, mx) in _mesh_aabbs.items():
-            renderer.draw_aabb_debug(screen, mn, mx,
-                                     camera_pos, camera_angles,
-                                     color=(64, 128, 255))
+        for key in meshes:
+            if key in physics.rigid_bodies:
+                verts = np.array(physics.rigid_bodies[key].get_vertices())
+                renderer.draw_aabb_debug(screen, verts.min(axis=0), verts.max(axis=0),
+                                         camera_pos, camera_angles,
+                                         color=(255, 160, 60))
+            elif key in _mesh_aabbs:
+                mn, mx = _mesh_aabbs[key]
+                renderer.draw_aabb_debug(screen, mn, mx,
+                                         camera_pos, camera_angles,
+                                         color=(64, 128, 255))
 
     flags = [f"RENDERER: {'GPU (RX 7900 XTX)' if gpu_mode else 'CPU (Software)'}"]
     if debug_hitboxes: flags.append("HITBOX")
@@ -189,7 +265,7 @@ while running:
     line1 = (f"yaw={yaw:6.1f}  pitch={pitch:6.1f}"
              f"  pos=({p[0]:.1f},{p[1]:.1f},{p[2]:.1f})")
     line2 = "  ".join(flags) if flags else ""
-    line3 = "4=hitbox  5=noclip  6=fly  7=toggle GPU/CPU"
+    line3 = "E=pickup/drop  LMB=throw  4=hitbox  5=noclip  6=fly  7=GPU/CPU"
     line4 = str(clock)
 
     screen.blit(my_font.render(line1, True, hud_col),  (6, 6))

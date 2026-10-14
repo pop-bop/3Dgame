@@ -2,6 +2,7 @@ import struct
 import numpy as np
 import cv2
 import pygame
+import moderngl
 
 _MAGIC   = b"QWZX"
 _VERSION = 1
