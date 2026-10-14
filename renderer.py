@@ -489,9 +489,9 @@ def _get_gpu_texture(texture):
     global _gpu_ctx, _gpu_textures
     if _gpu_ctx is None or texture is None:
         return None
+
     tex_id = id(texture)
     if tex_id not in _gpu_textures:
-        import moderngl
         th, tw = texture.shape[:2]
         tex_rgb = np.ascontiguousarray(texture[:, :, ::-1])
         gl_tex = _gpu_ctx.texture((tw, th), 3, tex_rgb.tobytes())
