@@ -24,14 +24,17 @@
       "mesh": "cylinder",
       "pos": [
         2.0,
-        0.0,
+        1.0,
         0.0
       ],
       "rot": [
         0,
         0,
         0
-      ]
+      ],
+      "rigid_body": true,
+      "physics_file": "cylinder_physics.json"
+
     },
     {
       "mesh": "concrete_box",
@@ -44,6 +47,19 @@
         0,
         0,
         20
+      ]
+    },
+    {
+      "mesh": "floor",
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rot": [
+        0,
+        0,
+        0
       ]
     }
   ]

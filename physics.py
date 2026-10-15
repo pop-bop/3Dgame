@@ -959,9 +959,15 @@ def _resolve_capsule_mesh():
             v1 = ms["v1"]
             v2 = ms["v2"]
 
+            box_mn = center - np.array([PLAYER_R + 0.1, PLAYER_H / 2.0 + PLAYER_R + 0.1, PLAYER_R + 0.1])
+            box_mx = center + np.array([PLAYER_R + 0.1, PLAYER_H / 2.0 + PLAYER_R + 0.1, PLAYER_R + 0.1])
+            tri_mn = np.minimum(np.minimum(v0, v1), v2)
+            tri_mx = np.maximum(np.maximum(v0, v1), v2)
+            overlap_mask = (tri_mx >= box_mn) & (tri_mn <= box_mx)
+
             signed_dist = normals @ center - plane_d
 
-            candidates = np.where(np.abs(signed_dist) < (PLAYER_H / 2.0 + PLAYER_R + 0.1))[0]
+            candidates = np.where(overlap_mask.all(axis=1) & (np.abs(signed_dist) < (PLAYER_H / 2.0 + PLAYER_R + 0.1)))[0]
 
             if len(candidates) > 0:
                 penetrations = []

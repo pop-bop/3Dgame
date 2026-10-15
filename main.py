@@ -85,8 +85,6 @@ def load_map(path):
 
 meshes, positions, rotations, player_start, objects_meta = load_map(os.path.join(ROOT, "map.json"))
 
-physics.add_static("ground", [-500, -0.2, -500], [500, 0.0, 500])
-
 for key, mesh in meshes.items():
     obj_info = objects_meta.get(key, {})
     is_rigid = obj_info.get("rigid_body", False)
