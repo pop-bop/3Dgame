@@ -9,12 +9,27 @@ _VERSION = 1
 
 _USE_GPU_COMPUTE = True
 _gpu_ctx = None
+_gpu_geom_shader = None
 _gpu_compute_shader = None
 _gpu_color_tex = None
 _gpu_readback_buf = None
 _gpu_ssbo = None
 _gpu_ssbo_cap = 0
+_gpu_raw_tri_ssbo = None
+_gpu_raw_tri_cap = 0
+_gpu_instance_ssbo = None
+_gpu_instance_cap = 0
+_gpu_counter_ssbo = None
+_gpu_tex_data_ssbo = None
+_gpu_tex_meta_ssbo = None
+_gpu_raw_tri_chunks = []
+_gpu_total_cached_tris = 0
 _gpu_textures = {}
+_gpu_tex_slot_cache = {}
+_gpu_tex_refs = []
+_gpu_tex_meta_list = []
+_gpu_tex_data_chunks = []
+_gpu_total_texels = 0
 _gpu_w = 0
 _gpu_h = 0
 
@@ -123,6 +138,10 @@ def load_qwzx(path):
 def prepare_mesh(mesh):
     mesh["verts"]  = np.array(mesh["tris"], dtype=np.float32)
     mesh["uv_arr"] = np.array(mesh["uvs"],  dtype=np.float32) if mesh["uvs"] else None
+    if _USE_GPU_COMPUTE and (_gpu_ctx is not None or _init_gpu_compute(640, 640)):
+        _ensure_gpu_mesh(mesh)
+        if mesh.get("texture") is not None and mesh["uv_arr"] is not None:
+            _ensure_gpu_texture(mesh["texture"])
     return mesh
 
 
@@ -359,6 +378,208 @@ def draw_flat_triangle(screen_arr, zbuf, screen_pts, zs, color):
     screen_arr[px, py] = np.array(color, dtype=np.uint8)[::-1]
 
 
+# Stage 1 Compute Shader: 3D-to-2D Vertex Transform, Backface Culling,
+# Near-Plane Clipping, UV Interpolation, and Screen-Space Projection
+_GPU_GEOM_SHADER_SRC = """#version 430
+layout(local_size_x = 64) in;
+
+struct RawTri {
+    vec4 v0;    // v0.xyz, uv0.x
+    vec4 v1;    // v1.xyz, uv0.y
+    vec4 v2;    // v2.xyz, uv1.x
+    vec4 uvs;   // uv1.y, uv2.x, uv2.y, 0.0
+    vec4 color; // r, g, b, 1.0
+};
+
+struct InstanceData {
+    vec4 r0;    // R[0,0], R[0,1], R[0,2], pos.x
+    vec4 r1;    // R[1,0], R[1,1], R[1,2], pos.y
+    vec4 r2;    // R[2,0], R[2,1], R[2,2], pos.z
+    ivec4 meta; // raw_tri_start, raw_tri_count, tex_id, cum_tri_start
+};
+
+struct ScreenTri {
+    vec4 p0;
+    vec4 p1;
+    vec4 p2;
+    vec4 uv0;
+    vec4 uv1;
+    vec4 uv2;
+    vec4 bb;
+    vec4 color;
+    int tex_id;
+    int pad0, pad1, pad2;
+};
+
+layout(std430, binding = 0) writeonly buffer TriBuffer {
+    ScreenTri triangles[];
+};
+
+layout(std430, binding = 1) readonly buffer RawTriBuffer {
+    RawTri raw_tris[];
+};
+
+layout(std430, binding = 2) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
+
+layout(std430, binding = 3) coherent buffer CounterBuffer {
+    uint screen_tri_count;
+};
+
+uniform vec4 u_vp_r0;
+uniform vec4 u_vp_r1;
+uniform vec4 u_vp_r2;
+uniform vec4 u_vp_r3;
+uniform vec3 u_eye;
+uniform float u_near;
+uniform int u_width;
+uniform int u_height;
+uniform int u_total_input_tris;
+uniform int u_num_instances;
+uniform int u_max_screen_tris;
+
+vec3 transform_world(InstanceData inst, vec3 v) {
+    return vec3(
+        dot(inst.r0.xyz, v) + inst.r0.w,
+        dot(inst.r1.xyz, v) + inst.r1.w,
+        dot(inst.r2.xyz, v) + inst.r2.w
+    );
+}
+
+vec4 transform_clip(vec3 w) {
+    vec4 hom = vec4(w, 1.0);
+    return vec4(
+        dot(u_vp_r0, hom),
+        dot(u_vp_r1, hom),
+        dot(u_vp_r2, hom),
+        dot(u_vp_r3, hom)
+    );
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= u_total_input_tris || u_num_instances <= 0) return;
+
+    int lo = 0;
+    int hi = u_num_instances - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (instances[mid].meta.w <= gid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    InstanceData inst = instances[lo];
+    int local_idx = gid - inst.meta.w;
+    if (local_idx < 0 || local_idx >= inst.meta.y) return;
+
+    RawTri raw = raw_tris[inst.meta.x + local_idx];
+
+    vec3 w0 = transform_world(inst, raw.v0.xyz);
+    vec3 w1 = transform_world(inst, raw.v1.xyz);
+    vec3 w2 = transform_world(inst, raw.v2.xyz);
+
+    vec3 normal = cross(w1 - w0, w2 - w0);
+    if (dot(normal, u_eye - w0) <= 0.0) return;
+
+    vec4 in_c[3];
+    in_c[0] = transform_clip(w0);
+    in_c[1] = transform_clip(w1);
+    in_c[2] = transform_clip(w2);
+
+    vec2 in_uv[3];
+    in_uv[0] = vec2(raw.v0.w, raw.v1.w);
+    in_uv[1] = vec2(raw.v2.w, raw.uvs.x);
+    in_uv[2] = vec2(raw.uvs.y, raw.uvs.z);
+
+    vec4 clip_c[4];
+    vec2 clip_uv[4];
+    int num_clipped = 0;
+
+    for (int i = 0; i < 3; ++i) {
+        int next = (i + 1) % 3;
+        vec4 a_c = in_c[i];
+        vec2 a_uv = in_uv[i];
+        vec4 b_c = in_c[next];
+        vec2 b_uv = in_uv[next];
+
+        bool a_in = a_c.w > u_near;
+        bool b_in = b_c.w > u_near;
+
+        if (a_in) {
+            clip_c[num_clipped] = a_c;
+            clip_uv[num_clipped] = a_uv;
+            num_clipped++;
+        }
+        if (a_in != b_in) {
+            float t = (a_c.w - u_near) / (a_c.w - b_c.w);
+            clip_c[num_clipped] = mix(a_c, b_c, t);
+            clip_uv[num_clipped] = mix(a_uv, b_uv, t);
+            num_clipped++;
+        }
+    }
+
+    if (num_clipped < 3) return;
+
+    float sw = float(u_width);
+    float sh = float(u_height);
+    int tex_id = inst.meta.z;
+
+    for (int k = 1; k < num_clipped - 1; ++k) {
+        vec4 pa = clip_c[0];
+        vec4 pb = clip_c[k];
+        vec4 pc = clip_c[k + 1];
+
+        vec2 uva = clip_uv[0];
+        vec2 uvb = clip_uv[k];
+        vec2 uvc = clip_uv[k + 1];
+
+        float inv_wa = 1.0 / max(pa.w, 1e-6);
+        float inv_wb = 1.0 / max(pb.w, 1e-6);
+        float inv_wc = 1.0 / max(pc.w, 1e-6);
+
+        float p0_x = (pa.x * inv_wa + 1.0) * 0.5 * sw;
+        float p0_y = (1.0 - pa.y * inv_wa) * 0.5 * sh;
+        float p1_x = (pb.x * inv_wb + 1.0) * 0.5 * sw;
+        float p1_y = (1.0 - pb.y * inv_wb) * 0.5 * sh;
+        float p2_x = (pc.x * inv_wc + 1.0) * 0.5 * sw;
+        float p2_y = (1.0 - pc.y * inv_wc) * 0.5 * sh;
+
+        float min_x = max(0.0, min(p0_x, min(p1_x, p2_x)));
+        float max_x = min(sw - 1.0, max(p0_x, max(p1_x, p2_x)));
+        float min_y = max(0.0, min(p0_y, min(p1_y, p2_y)));
+        float max_y = min(sh - 1.0, max(p0_y, max(p1_y, p2_y)));
+        if (min_x > max_x || min_y > max_y) continue;
+
+        float denom = (p1_y - p2_y) * (p0_x - p2_x) + (p2_x - p1_x) * (p0_y - p2_y);
+        if (abs(denom) < 1e-10) continue;
+
+        uint out_idx = atomicAdd(screen_tri_count, 1u);
+        if (out_idx >= uint(u_max_screen_tris)) continue;
+
+        ScreenTri st;
+        st.p0 = vec4(p0_x, p0_y, pa.z * inv_wa, inv_wa);
+        st.p1 = vec4(p1_x, p1_y, pb.z * inv_wb, inv_wb);
+        st.p2 = vec4(p2_x, p2_y, pc.z * inv_wc, inv_wc);
+        st.uv0 = vec4(uva, 0.0, 0.0);
+        st.uv1 = vec4(uvb, 0.0, 0.0);
+        st.uv2 = vec4(uvc, 0.0, 0.0);
+        st.bb = vec4(min_x, min_y, max_x, max_y);
+        st.color = raw.color;
+        st.tex_id = tex_id;
+        st.pad0 = 0;
+        st.pad1 = 0;
+        st.pad2 = 0;
+        triangles[out_idx] = st;
+    }
+}
+"""
+
+# Stage 2 Compute Shader: Per-Pixel Rasterization, Depth Buffering,
+# Perspective-Correct UV Interpolation, and GPU Texture Mapping
 _GPU_COMPUTE_SHADER_SRC = """#version 430
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -372,19 +593,6 @@ layout(binding = 4) uniform sampler2D u_tex4;
 layout(binding = 5) uniform sampler2D u_tex5;
 layout(binding = 6) uniform sampler2D u_tex6;
 layout(binding = 7) uniform sampler2D u_tex7;
-
-vec4 sample_mesh_tex(int id, vec2 uv) {
-    vec2 clamped_uv = clamp(uv, 0.0, 1.0);
-    if (id == 0) return textureLod(u_tex0, clamped_uv, 0.0);
-    if (id == 1) return textureLod(u_tex1, clamped_uv, 0.0);
-    if (id == 2) return textureLod(u_tex2, clamped_uv, 0.0);
-    if (id == 3) return textureLod(u_tex3, clamped_uv, 0.0);
-    if (id == 4) return textureLod(u_tex4, clamped_uv, 0.0);
-    if (id == 5) return textureLod(u_tex5, clamped_uv, 0.0);
-    if (id == 6) return textureLod(u_tex6, clamped_uv, 0.0);
-    if (id == 7) return textureLod(u_tex7, clamped_uv, 0.0);
-    return vec4(1.0);
-}
 
 struct ScreenTri {
     vec4 p0;
@@ -403,21 +611,72 @@ layout(std430, binding = 0) readonly buffer TriBuffer {
     ScreenTri triangles[];
 };
 
-uniform int u_num_tris;
+layout(std430, binding = 3) readonly buffer CounterBuffer {
+    uint screen_tri_count;
+};
+
+layout(std430, binding = 4) readonly buffer TexDataBuffer {
+    uint tex_pixels[];
+};
+
+layout(std430, binding = 5) readonly buffer TexMetaBuffer {
+    ivec4 tex_meta[]; // offset, width, height, 0
+};
+
+vec4 sample_ssbo_tex(int id, vec2 clamped_uv) {
+    ivec4 meta = tex_meta[id];
+    int offset = meta.x;
+    int tw = meta.y;
+    int th = meta.z;
+    if (tw <= 0 || th <= 0) return vec4(1.0);
+
+    float fx = clamped_uv.x * float(tw - 1);
+    float fy = clamped_uv.y * float(th - 1);
+    int x0 = clamp(int(floor(fx)), 0, tw - 1);
+    int y0 = clamp(int(floor(fy)), 0, th - 1);
+    int x1 = min(x0 + 1, tw - 1);
+    int y1 = min(y0 + 1, th - 1);
+    float dx = fx - float(x0);
+    float dy = fy - float(y0);
+
+    vec4 c00 = unpackUnorm4x8(tex_pixels[offset + y0 * tw + x0]);
+    vec4 c10 = unpackUnorm4x8(tex_pixels[offset + y0 * tw + x1]);
+    vec4 c01 = unpackUnorm4x8(tex_pixels[offset + y1 * tw + x0]);
+    vec4 c11 = unpackUnorm4x8(tex_pixels[offset + y1 * tw + x1]);
+    return mix(mix(c00, c10, dx), mix(c01, c11, dx), dy);
+}
+
+vec4 sample_mesh_tex(int id, vec2 uv) {
+    vec2 clamped_uv = clamp(uv, 0.0, 1.0);
+    if (id == 0) return textureLod(u_tex0, clamped_uv, 0.0);
+    if (id == 1) return textureLod(u_tex1, clamped_uv, 0.0);
+    if (id == 2) return textureLod(u_tex2, clamped_uv, 0.0);
+    if (id == 3) return textureLod(u_tex3, clamped_uv, 0.0);
+    if (id == 4) return textureLod(u_tex4, clamped_uv, 0.0);
+    if (id == 5) return textureLod(u_tex5, clamped_uv, 0.0);
+    if (id == 6) return textureLod(u_tex6, clamped_uv, 0.0);
+    if (id == 7) return textureLod(u_tex7, clamped_uv, 0.0);
+    if (id >= 8) return sample_ssbo_tex(id, clamped_uv);
+    return vec4(1.0);
+}
+
 uniform int u_width;
 uniform int u_height;
+uniform int u_max_screen_tris;
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= u_width || pixel.y >= u_height) return;
 
     vec2 p = vec2(pixel) + 0.5;
-    float best_depth = 1.0;
+    float best_depth = 1e30;
     vec4 best_color = vec4(0.0, 0.0, 0.0, 1.0);
 
-    for (int i = 0; i < u_num_tris; ++i) {
+    int num_tris = min(int(screen_tri_count), u_max_screen_tris);
+
+    for (int i = 0; i < num_tris; ++i) {
         ScreenTri tri = triangles[i];
-        
+
         if (p.x < tri.bb.x || p.x > tri.bb.z || p.y < tri.bb.y || p.y > tri.bb.w) continue;
 
         vec2 p0 = tri.p0.xy;
@@ -458,12 +717,27 @@ _GPU_DTYPE = np.dtype([
     ('tex_id', 'i4'), ('pad0', 'i4'), ('pad1', 'i4'), ('pad2', 'i4')
 ])
 
+_GPU_RAW_TRI_DTYPE = np.dtype([
+    ('v0', 'f4', 4),
+    ('v1', 'f4', 4),
+    ('v2', 'f4', 4),
+    ('uvs', 'f4', 4),
+    ('color', 'f4', 4),
+])
+
+_GPU_INSTANCE_DTYPE = np.dtype([
+    ('r0', 'f4', 4),
+    ('r1', 'f4', 4),
+    ('r2', 'f4', 4),
+    ('meta', 'i4', 4),
+])
+
 
 def _init_gpu_compute(width, height):
-    global _gpu_ctx, _gpu_compute_shader, _gpu_color_tex, _gpu_readback_buf, _gpu_w, _gpu_h
+    global _gpu_ctx, _gpu_geom_shader, _gpu_compute_shader, _gpu_color_tex
+    global _gpu_readback_buf, _gpu_counter_ssbo, _gpu_tex_data_ssbo, _gpu_tex_meta_ssbo, _gpu_w, _gpu_h
     if _gpu_ctx is None:
         try:
-            import moderngl
             _gpu_ctx = moderngl.create_context(standalone=True, require=430)
         except Exception as e:
             print(f"[Renderer] ModernGL GPU compute init failed: {e}. Falling back to CPU rasterizer.")
@@ -475,190 +749,226 @@ def _init_gpu_compute(width, height):
         _gpu_color_tex.bind_to_image(0, read=False, write=True)
         _gpu_readback_buf = bytearray(width * height * 4)
 
+    if _gpu_geom_shader is None:
+        try:
+            _gpu_geom_shader = _gpu_ctx.compute_shader(_GPU_GEOM_SHADER_SRC)
+        except Exception as e:
+            print(f"[Renderer] Geometry compute shader compilation failed: {e}. Falling back to CPU rasterizer.")
+            return False
+
     if _gpu_compute_shader is None:
         try:
             _gpu_compute_shader = _gpu_ctx.compute_shader(_GPU_COMPUTE_SHADER_SRC)
         except Exception as e:
-            print(f"[Renderer] Compute shader compilation failed: {e}. Falling back to CPU rasterizer.")
+            print(f"[Renderer] Raster compute shader compilation failed: {e}. Falling back to CPU rasterizer.")
             return False
+
+    if _gpu_counter_ssbo is None:
+        _gpu_counter_ssbo = _gpu_ctx.buffer(reserve=16)
+
+    if _gpu_tex_data_ssbo is None:
+        _gpu_tex_data_ssbo = _gpu_ctx.buffer(reserve=16)
+
+    if _gpu_tex_meta_ssbo is None:
+        _gpu_tex_meta_ssbo = _gpu_ctx.buffer(reserve=16)
 
     return True
 
 
-def _get_gpu_texture(texture):
-    global _gpu_ctx, _gpu_textures
+def _ensure_gpu_mesh(mesh):
+    global _gpu_raw_tri_ssbo, _gpu_raw_tri_cap, _gpu_raw_tri_chunks, _gpu_total_cached_tris
+    cached = mesh.get("_gpu_tri_slice")
+    if cached is not None and cached[0] is _gpu_ctx:
+        return cached[1], cached[2]
+
+    verts = mesh.get("verts")
+    if verts is None:
+        verts = np.array(mesh["tris"], dtype=np.float32)
+        mesh["verts"] = verts
+    uv_arr = mesh.get("uv_arr")
+    if uv_arr is None and mesh.get("uvs") is not None:
+        uv_arr = np.array(mesh["uvs"], dtype=np.float32)
+        mesh["uv_arr"] = uv_arr
+
+    colors = mesh.get("colors")
+    N = int(verts.shape[0])
+    start_tri = _gpu_total_cached_tris
+
+    if N > 0:
+        chunk = np.zeros(N, dtype=_GPU_RAW_TRI_DTYPE)
+        chunk['v0'][:, :3] = verts[:, 0, :]
+        chunk['v1'][:, :3] = verts[:, 1, :]
+        chunk['v2'][:, :3] = verts[:, 2, :]
+
+        if uv_arr is not None and len(uv_arr) == N:
+            chunk['v0'][:, 3] = uv_arr[:, 0, 0]
+            chunk['v1'][:, 3] = uv_arr[:, 0, 1]
+            chunk['v2'][:, 3] = uv_arr[:, 1, 0]
+            chunk['uvs'][:, 0] = uv_arr[:, 1, 1]
+            chunk['uvs'][:, 1] = uv_arr[:, 2, 0]
+            chunk['uvs'][:, 2] = uv_arr[:, 2, 1]
+
+        if colors is not None and len(colors) == N:
+            col_np = np.asarray(colors, dtype=np.float32) / 255.0
+            chunk['color'][:, :3] = col_np[:, :3]
+            chunk['color'][:, 3] = 1.0
+        else:
+            chunk['color'][:, :3] = 200.0 / 255.0
+            chunk['color'][:, 3] = 1.0
+
+        _gpu_raw_tri_chunks.append(chunk)
+        _gpu_total_cached_tris += N
+
+        all_raw_bytes = np.concatenate(_gpu_raw_tri_chunks).tobytes()
+        if _gpu_raw_tri_ssbo is None or len(all_raw_bytes) > _gpu_raw_tri_cap:
+            if _gpu_raw_tri_ssbo is not None:
+                _gpu_raw_tri_ssbo.release()
+            _gpu_raw_tri_ssbo = _gpu_ctx.buffer(reserve=max(len(all_raw_bytes) * 2, 65536))
+            _gpu_raw_tri_cap = _gpu_raw_tri_ssbo.size
+        _gpu_raw_tri_ssbo.write(all_raw_bytes)
+
+    mesh["_gpu_tri_slice"] = (_gpu_ctx, start_tri, N)
+    return start_tri, N
+
+
+def _ensure_gpu_texture(texture):
+    global _gpu_ctx, _gpu_textures, _gpu_tex_slot_cache, _gpu_tex_refs, _gpu_tex_meta_list
+    global _gpu_tex_data_chunks, _gpu_total_texels, _gpu_tex_data_ssbo, _gpu_tex_meta_ssbo
     if _gpu_ctx is None or texture is None:
-        return None
+        return -1
 
     tex_id = id(texture)
-    if tex_id not in _gpu_textures:
-        th, tw = texture.shape[:2]
-        tex_rgb = np.ascontiguousarray(texture[:, :, ::-1])
+    if tex_id in _gpu_tex_slot_cache:
+        return _gpu_tex_slot_cache[tex_id]
+
+    _gpu_tex_refs.append(texture)
+    slot = len(_gpu_tex_slot_cache)
+    th, tw = texture.shape[:2]
+    tex_rgb = np.ascontiguousarray(texture[:, :, ::-1], dtype=np.uint8)
+
+    if slot < 8:
         gl_tex = _gpu_ctx.texture((tw, th), 3, tex_rgb.tobytes())
         gl_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         gl_tex.build_mipmaps()
-        _gpu_textures[tex_id] = gl_tex
-    return _gpu_textures[tex_id]
+        _gpu_textures[slot] = gl_tex
+
+    # Also upload packed RGBA8 texels to GPU SSBO so >8 textures work seamlessly
+    rgba = np.empty((th, tw, 4), dtype=np.uint8)
+    rgba[:, :, :3] = tex_rgb
+    rgba[:, :, 3] = 255
+    packed_u32 = rgba.view(np.uint32).ravel().copy()
+
+    offset = _gpu_total_texels
+    _gpu_tex_data_chunks.append(packed_u32)
+    _gpu_total_texels += packed_u32.size
+    _gpu_tex_meta_list.append([offset, tw, th, 0])
+
+    all_tex_bytes = np.concatenate(_gpu_tex_data_chunks).tobytes()
+    if _gpu_tex_data_ssbo is not None:
+        _gpu_tex_data_ssbo.release()
+    _gpu_tex_data_ssbo = _gpu_ctx.buffer(all_tex_bytes)
+
+    meta_bytes = np.array(_gpu_tex_meta_list, dtype=np.int32).tobytes()
+    if _gpu_tex_meta_ssbo is not None:
+        _gpu_tex_meta_ssbo.release()
+    _gpu_tex_meta_ssbo = _gpu_ctx.buffer(meta_bytes)
+
+    _gpu_tex_slot_cache[tex_id] = slot
+    return slot
 
 
 def _render_scene_gpu(pygame_surface, meshes, positions, camera_pos, camera_angles,
                       rotations=None, fov_degrees=60.0, near=0.1, far=100.0):
-    global _gpu_ctx, _gpu_compute_shader, _gpu_color_tex, _gpu_readback_buf, _gpu_ssbo, _gpu_ssbo_cap
+    global _gpu_ctx, _gpu_geom_shader, _gpu_compute_shader, _gpu_color_tex
+    global _gpu_readback_buf, _gpu_ssbo, _gpu_ssbo_cap, _gpu_instance_ssbo, _gpu_instance_cap
 
     sw = pygame_surface.get_width()
     sh = pygame_surface.get_height()
     aspect = sh / sw
 
     eye, target, up = camera_pose_from_angles(camera_pos, camera_angles)
-    mat_vp = build_vp_matrix(eye, target, up, fov_degrees, aspect, near, far)
+    mat_vp = build_vp_matrix(eye, target, up, fov_degrees, aspect, near, far).astype(np.float32)
     eye_np = np.asarray(eye, dtype=np.float32)
 
-    screen_tris = []
-    bound_textures = []
-    texture_slot_map = {}
+    instance_rows = []
+    total_input_tris = 0
 
     for name, mesh in meshes.items():
-        pos = np.array(positions.get(name, [0.0, 0.0, 0.0]), dtype=np.float32)
+        tri_start, tri_count = _ensure_gpu_mesh(mesh)
+        if tri_count <= 0:
+            continue
+
+        pos = positions.get(name, [0.0, 0.0, 0.0])
         rot = rotations.get(name, [0.0, 0.0, 0.0]) if rotations else [0.0, 0.0, 0.0]
         R = rotation_matrix(rot).astype(np.float32)
 
-        verts = mesh.get("verts")
-        if verts is None:
-            verts = np.array(mesh["tris"], dtype=np.float32)
-        uv_arr = mesh.get("uv_arr")
         texture = mesh.get("texture")
-        colors = mesh.get("colors")
+        has_uvs = (mesh.get("uv_arr") is not None) or (mesh.get("uvs") is not None)
+        tex_slot = _ensure_gpu_texture(texture) if (texture is not None and has_uvs) else -1
 
-        tex_id = -1
-        if texture is not None:
-            raw_id = id(texture)
-            if raw_id not in texture_slot_map:
-                gl_t = _get_gpu_texture(texture)
-                if gl_t is not None and len(bound_textures) < 8:
-                    slot = len(bound_textures)
-                    texture_slot_map[raw_id] = slot
-                    bound_textures.append(gl_t)
-            tex_id = texture_slot_map.get(raw_id, -1)
+        instance_rows.append((
+            [R[0, 0], R[0, 1], R[0, 2], float(pos[0])],
+            [R[1, 0], R[1, 1], R[1, 2], float(pos[1])],
+            [R[2, 0], R[2, 1], R[2, 2], float(pos[2])],
+            [tri_start, tri_count, tex_slot, total_input_tris]
+        ))
+        total_input_tris += tri_count
 
-        N = verts.shape[0]
-        flat = verts.reshape(-1, 3)
-        world = flat @ R.T + pos
+    num_instances = len(instance_rows)
+    max_screen_tris = max(total_input_tris * 2, 1)
+    required_ssbo_bytes = max_screen_tris * _GPU_DTYPE.itemsize
+    if _gpu_ssbo is None or required_ssbo_bytes > _gpu_ssbo_cap:
+        if _gpu_ssbo is not None:
+            _gpu_ssbo.release()
+        _gpu_ssbo = _gpu_ctx.buffer(reserve=max(required_ssbo_bytes * 2, 65536))
+        _gpu_ssbo_cap = _gpu_ssbo.size
+    max_screen_tris = _gpu_ssbo_cap // _GPU_DTYPE.itemsize
 
-        ones = np.ones((N * 3, 1), dtype=np.float32)
-        hom = np.concatenate([world, ones], axis=1)
-        clip = (mat_vp @ hom.T).T.reshape(N, 3, 4)
-        world = world.reshape(N, 3, 3)
+    # Reset atomic screen triangle counter on GPU
+    _gpu_counter_ssbo.write(b'\x00\x00\x00\x00')
 
-        edge0 = world[:, 1] - world[:, 0]
-        edge1 = world[:, 2] - world[:, 0]
-        normals = np.cross(edge0, edge1)
-        to_cam = eye_np - world[:, 0]
-        facing = (normals * to_cam).sum(axis=1) > 0
+    if num_instances > 0 and total_input_tris > 0:
+        inst_bytes = np.array(instance_rows, dtype=_GPU_INSTANCE_DTYPE).tobytes()
+        if _gpu_instance_ssbo is None or len(inst_bytes) > _gpu_instance_cap:
+            if _gpu_instance_ssbo is not None:
+                _gpu_instance_ssbo.release()
+            _gpu_instance_ssbo = _gpu_ctx.buffer(reserve=max(len(inst_bytes) * 2, 4096))
+            _gpu_instance_cap = _gpu_instance_ssbo.size
+        _gpu_instance_ssbo.write(inst_bytes)
 
-        for idx in range(N):
-            if not facing[idx]:
-                continue
-
-            cv = clip[idx]
-            uv = uv_arr[idx] if uv_arr is not None else None
-            col = colors[idx] if (colors and idx < len(colors)) else [200, 200, 200]
-            col_f = [col[0] / 255.0, col[1] / 255.0, col[2] / 255.0, 1.0]
-
-            if uv is not None and tex_id >= 0:
-                c_verts = [np.append(cv[j], uv[j]) for j in range(3)]
-                clipped = _clip_near_plane(c_verts, near)
-                if len(clipped) < 3:
-                    continue
-                for k in range(1, len(clipped) - 1):
-                    pa, pb, pc = clipped[0], clipped[k], clipped[k + 1]
-                    inv_wa = 1.0 / max(pa[3], 1e-6)
-                    inv_wb = 1.0 / max(pb[3], 1e-6)
-                    inv_wc = 1.0 / max(pc[3], 1e-6)
-
-                    p0_x = (pa[0] * inv_wa + 1.0) * 0.5 * sw
-                    p0_y = (1.0 - pa[1] * inv_wa) * 0.5 * sh
-                    p1_x = (pb[0] * inv_wb + 1.0) * 0.5 * sw
-                    p1_y = (1.0 - pb[1] * inv_wb) * 0.5 * sh
-                    p2_x = (pc[0] * inv_wc + 1.0) * 0.5 * sw
-                    p2_y = (1.0 - pc[1] * inv_wc) * 0.5 * sh
-
-                    min_x = max(0.0, min(p0_x, p1_x, p2_x))
-                    max_x = min(float(sw - 1), max(p0_x, p1_x, p2_x))
-                    min_y = max(0.0, min(p0_y, p1_y, p2_y))
-                    max_y = min(float(sh - 1), max(p0_y, p1_y, p2_y))
-                    if min_x > max_x or min_y > max_y:
-                        continue
-
-                    denom = (p1_y - p2_y) * (p0_x - p2_x) + (p2_x - p1_x) * (p0_y - p2_y)
-                    if abs(denom) < 1e-10:
-                        continue
-
-                    screen_tris.append((
-                        [p0_x, p0_y, pa[2] * inv_wa, inv_wa],
-                        [p1_x, p1_y, pb[2] * inv_wb, inv_wb],
-                        [p2_x, p2_y, pc[2] * inv_wc, inv_wc],
-                        [pa[4], pa[5], 0.0, 0.0],
-                        [pb[4], pb[5], 0.0, 0.0],
-                        [pc[4], pc[5], 0.0, 0.0],
-                        [min_x, min_y, max_x, max_y],
-                        col_f, tex_id, 0, 0, 0
-                    ))
-            else:
-                c_verts = [cv[j] for j in range(3)]
-                clipped = _clip_near_plane(c_verts, near)
-                if len(clipped) < 3:
-                    continue
-                for k in range(1, len(clipped) - 1):
-                    pa, pb, pc = clipped[0], clipped[k], clipped[k + 1]
-                    inv_wa = 1.0 / max(pa[3], 1e-6)
-                    inv_wb = 1.0 / max(pb[3], 1e-6)
-                    inv_wc = 1.0 / max(pc[3], 1e-6)
-
-                    p0_x = (pa[0] * inv_wa + 1.0) * 0.5 * sw
-                    p0_y = (1.0 - pa[1] * inv_wa) * 0.5 * sh
-                    p1_x = (pb[0] * inv_wb + 1.0) * 0.5 * sw
-                    p1_y = (1.0 - pb[1] * inv_wb) * 0.5 * sh
-                    p2_x = (pc[0] * inv_wc + 1.0) * 0.5 * sw
-                    p2_y = (1.0 - pc[1] * inv_wc) * 0.5 * sh
-
-                    min_x = max(0.0, min(p0_x, p1_x, p2_x))
-                    max_x = min(float(sw - 1), max(p0_x, p1_x, p2_x))
-                    min_y = max(0.0, min(p0_y, p1_y, p2_y))
-                    max_y = min(float(sh - 1), max(p0_y, p1_y, p2_y))
-                    if min_x > max_x or min_y > max_y:
-                        continue
-
-                    denom = (p1_y - p2_y) * (p0_x - p2_x) + (p2_x - p1_x) * (p0_y - p2_y)
-                    if abs(denom) < 1e-10:
-                        continue
-
-                    screen_tris.append((
-                        [p0_x, p0_y, pa[2] * inv_wa, inv_wa],
-                        [p1_x, p1_y, pb[2] * inv_wb, inv_wb],
-                        [p2_x, p2_y, pc[2] * inv_wc, inv_wc],
-                        [0.0, 0.0, 0.0, 0.0],
-                        [0.0, 0.0, 0.0, 0.0],
-                        [0.0, 0.0, 0.0, 0.0],
-                        [min_x, min_y, max_x, max_y],
-                        col_f, -1, 0, 0, 0
-                    ))
-
-    num_tris = len(screen_tris)
-    if num_tris > 0:
-        tri_bytes = np.array(screen_tris, dtype=_GPU_DTYPE).tobytes()
-        if _gpu_ssbo is None or len(tri_bytes) > _gpu_ssbo_cap:
-            _gpu_ssbo = _gpu_ctx.buffer(reserve=max(len(tri_bytes) * 2, 65536))
-            _gpu_ssbo_cap = _gpu_ssbo.size
-        _gpu_ssbo.write(tri_bytes)
         _gpu_ssbo.bind_to_storage_buffer(0)
+        _gpu_raw_tri_ssbo.bind_to_storage_buffer(1)
+        _gpu_instance_ssbo.bind_to_storage_buffer(2)
+        _gpu_counter_ssbo.bind_to_storage_buffer(3)
 
-    for idx, gl_t in enumerate(bound_textures):
-        gl_t.use(location=idx)
+        _gpu_geom_shader["u_vp_r0"].value = tuple(mat_vp[0])
+        _gpu_geom_shader["u_vp_r1"].value = tuple(mat_vp[1])
+        _gpu_geom_shader["u_vp_r2"].value = tuple(mat_vp[2])
+        _gpu_geom_shader["u_vp_r3"].value = tuple(mat_vp[3])
+        _gpu_geom_shader["u_eye"].value = tuple(eye_np)
+        _gpu_geom_shader["u_near"].value = float(near)
+        _gpu_geom_shader["u_width"].value = sw
+        _gpu_geom_shader["u_height"].value = sh
+        _gpu_geom_shader["u_total_input_tris"].value = total_input_tris
+        _gpu_geom_shader["u_num_instances"].value = num_instances
+        _gpu_geom_shader["u_max_screen_tris"].value = max_screen_tris
 
-    _gpu_compute_shader["u_num_tris"].value = num_tris
+        _gpu_geom_shader.run((total_input_tris + 63) // 64, 1, 1)
+        _gpu_ctx.memory_barrier()
+
+    _gpu_ssbo.bind_to_storage_buffer(0)
+    _gpu_counter_ssbo.bind_to_storage_buffer(3)
+    _gpu_tex_data_ssbo.bind_to_storage_buffer(4)
+    _gpu_tex_meta_ssbo.bind_to_storage_buffer(5)
+
+    for slot, gl_t in _gpu_textures.items():
+        gl_t.use(location=slot)
+
     _gpu_compute_shader["u_width"].value = sw
     _gpu_compute_shader["u_height"].value = sh
-    _gpu_compute_shader.run((sw + 15) // 16, (sh + 15) // 16)
+    _gpu_compute_shader["u_max_screen_tris"].value = max_screen_tris
+    _gpu_compute_shader.run((sw + 15) // 16, (sh + 15) // 16, 1)
+    _gpu_ctx.memory_barrier()
 
     _gpu_color_tex.read_into(_gpu_readback_buf)
     surf = pygame.image.frombuffer(_gpu_readback_buf, (sw, sh), 'RGBA')
