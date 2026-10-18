@@ -48,14 +48,26 @@ def load_or_migrate(name):
         json_path = os.path.join(ROOT, f"{name}.json")
 
     if os.path.exists(qwzx_path):
-        return renderer.load_qwzx(qwzx_path)[0]
+        loaded = renderer.load_qwzx(qwzx_path)
+        return renderer.combine_submeshes(loaded, name=name)
     if os.path.exists(json_path):
         mesh = _json_to_mesh(json_path)
         os.makedirs(ASSETS_DIR, exist_ok=True)
         save_path = os.path.join(ASSETS_DIR, f"{name}.qwzx")
         renderer.save_qwzx(save_path, [mesh])
-        return mesh
+        return renderer.prepare_mesh(mesh)
     raise FileNotFoundError(f"Neither {qwzx_path} nor {json_path} found")
+
+
+def _clone_with_alpha(mesh_dict, alpha):
+    subs = renderer.get_submeshes(mesh_dict)
+    cloned_subs = []
+    for sm in subs:
+        sm_copy = dict(sm)
+        sm_copy.pop("_gpu_tri_slice", None)
+        sm_copy["alpha"] = float(sm.get("alpha", 1.0)) * float(alpha)
+        cloned_subs.append(sm_copy)
+    return renderer.combine_submeshes(cloned_subs, name=mesh_dict.get("name"))
 
 
 def load_map(path):
@@ -75,7 +87,11 @@ def load_map(path):
         if mesh_name not in base_meshes:
             base_meshes[mesh_name] = renderer.prepare_mesh(load_or_migrate(mesh_name))
 
-        meshes[key]       = base_meshes[mesh_name]
+        obj_mesh = base_meshes[mesh_name]
+        if "alpha" in obj:
+            obj_mesh = _clone_with_alpha(obj_mesh, obj["alpha"])
+
+        meshes[key]       = obj_mesh
         positions[key]    = obj["pos"]
         rotations[key]    = obj.get("rot", [0, 0, 0])
         objects_meta[key] = obj
@@ -104,7 +120,8 @@ physics.player["pos"][:] = player_start
 _mesh_aabbs = {}
 for key, mesh in meshes.items():
     verts = mesh["verts"].reshape(-1, 3).astype(np.float32)
-    wpos  = verts + np.array(positions[key], dtype=np.float32)
+    R     = renderer.rotation_matrix(rotations.get(key, [0, 0, 0])).astype(np.float32)
+    wpos  = verts @ R.T + np.array(positions[key], dtype=np.float32)
     _mesh_aabbs[key] = (wpos.min(axis=0), wpos.max(axis=0))
 
 
@@ -117,6 +134,7 @@ debug_hitboxes = False
 no_collision   = False
 fly_mode       = False
 gpu_mode       = True
+shader_mode    = renderer.get_shader_mode()
 
 yaw   = 0.0
 pitch = 0.0
@@ -188,6 +206,8 @@ while running:
             elif event.key == pygame.K_7:
                 gpu_mode = not gpu_mode
                 renderer.set_gpu_acceleration(gpu_mode)
+            elif event.key == pygame.K_8:
+                shader_mode = renderer.cycle_shader_mode()
 
     pygame.mouse.set_pos(_CX, _CY)
     _skip_warp = True
@@ -256,7 +276,7 @@ while running:
         renderer.draw_aabb_debug(screen, pmn, pmx,
                                  camera_pos, camera_angles,
                                  color=(0, 255, 0))
-        for key in meshes:
+        for key, mesh in meshes.items():
             if key in physics.rigid_bodies:
                 verts = np.array(physics.rigid_bodies[key].get_vertices())
                 renderer.draw_aabb_debug(screen, verts.min(axis=0), verts.max(axis=0),
@@ -267,8 +287,15 @@ while running:
                 renderer.draw_aabb_debug(screen, mn, mx,
                                          camera_pos, camera_angles,
                                          color=(64, 128, 255))
+            renderer.draw_normals_debug(screen, mesh,
+                                        positions[key], rotations.get(key, [0, 0, 0]),
+                                        camera_pos, camera_angles)
 
-    flags = [f"RENDERER: {'GPU (RX 7900 XTX)' if gpu_mode else 'CPU (Software)'}"]
+
+    flags = [
+        f"RENDERER: {'GPU (RX 7900 XTX)' if gpu_mode else 'CPU (Software)'}",
+        f"SHADER: {shader_mode.upper()}"
+    ]
     if debug_hitboxes: flags.append("HITBOX")
     if no_collision:   flags.append("NOCLIP")
     if fly_mode:       flags.append("FLY")
@@ -277,7 +304,7 @@ while running:
     line1 = (f"yaw={yaw:6.1f}  pitch={pitch:6.1f}"
              f"  pos=({p[0]:.1f},{p[1]:.1f},{p[2]:.1f})")
     line2 = "  ".join(flags) if flags else ""
-    line3 = "E=pickup/drop  LMB=throw  4=hitbox  5=noclip  6=fly  7=GPU/CPU"
+    line3 = "E=pickup/drop  LMB=throw  4=hitbox  5=noclip  6=fly  7=GPU/CPU  8=shader"
     line4 = str(clock)
 
     screen.blit(my_font.render(line1, True, hud_col),  (6, 6))

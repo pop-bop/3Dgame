@@ -1,5 +1,5 @@
 {
-  "mass": 200.0,
+  "mass": 2.0,
   "init vel": [0.0, 2.0, -1.0],
   "angular velocity": [0.5, 1.5, 0.0],
   "frictional coefficient": 0.3,

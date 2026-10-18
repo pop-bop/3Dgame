@@ -16,8 +16,6 @@ def _parse_face_vertex(token):
 
 
 def _load_mtl(mtl_path):
-
-
     materials = {}
     current   = None
     base_dir  = os.path.dirname(mtl_path)
@@ -32,7 +30,20 @@ def _load_mtl(mtl_path):
                 kw    = parts[0].lower()
                 if kw == "newmtl":
                     current = parts[1]
-                    materials[current] = {"map_Kd": None}
+                    materials[current] = {
+                        "map_Kd": None,
+                        "Kd": [180, 180, 180],
+                        "alpha": 1.0,
+                    }
+                elif kw == "kd" and current and len(parts) >= 4:
+                    r = int(round(max(0.0, min(1.0, float(parts[1]))) * 255.0))
+                    g = int(round(max(0.0, min(1.0, float(parts[2]))) * 255.0))
+                    b = int(round(max(0.0, min(1.0, float(parts[3]))) * 255.0))
+                    materials[current]["Kd"] = [r, g, b]
+                elif kw == "d" and current and len(parts) >= 2:
+                    materials[current]["alpha"] = max(0.0, min(1.0, float(parts[1])))
+                elif kw == "tr" and current and len(parts) >= 2:
+                    materials[current]["alpha"] = max(0.0, min(1.0, 1.0 - float(parts[1])))
                 elif kw == "map_kd" and current:
                     tex_file = " ".join(parts[1:])
                     tex_path = os.path.join(base_dir, tex_file)
@@ -69,7 +80,7 @@ def parse_obj(obj_path):
 
             elif kw == "vt":
                 u = float(parts[1])
-                v = float(parts[2]) if len(parts) > 2 else 0.0
+                v = 1.0 - float(parts[2]) if len(parts) > 2 else 0.0
                 uvs_raw.append([u, v])
 
             elif kw == "mtllib":
@@ -109,19 +120,36 @@ def parse_obj(obj_path):
 
         mat_info = materials.get(mat_name, {})
         tex_path = mat_info.get("map_Kd")
+        kd       = mat_info.get("Kd", [180, 180, 180])
+        alpha    = float(mat_info.get("alpha", 1.0))
+        alpha_u8 = int(round(max(0.0, min(1.0, alpha)) * 255.0))
         texture  = None
 
         if tex_path and os.path.exists(tex_path):
-            texture = cv2.imread(tex_path)
+            texture = cv2.imread(tex_path, cv2.IMREAD_UNCHANGED)
             if texture is None:
                 print(f"Warning: could not load texture {tex_path}")
+            else:
+                if texture.ndim == 2:
+                    texture = cv2.cvtColor(texture, cv2.COLOR_GRAY2BGR)
+                if alpha_u8 < 255:
+                    if texture.shape[2] == 4:
+                        texture = texture.copy()
+                        texture[:, :, 3] = (texture[:, :, 3].astype(float) * alpha).round().astype("uint8")
+                    else:
+                        h, w = texture.shape[:2]
+                        bgra = cv2.cvtColor(texture, cv2.COLOR_BGR2BGRA)
+                        bgra[:, :, 3] = alpha_u8
+                        texture = bgra
 
+        face_col = [kd[0], kd[1], kd[2], alpha_u8] if alpha_u8 < 255 else [kd[0], kd[1], kd[2]]
         mesh = {
             "name":    mat_name,
             "tris":    group["tris"],
-            "colors":  [[180, 180, 180]] * len(group["tris"]) if texture is None else None,
+            "colors":  [face_col] * len(group["tris"]) if texture is None else None,
             "texture": texture,
             "uvs":     group["uvs"] if texture is not None else None,
+            "alpha":   alpha,
         }
         meshes.append(mesh)
 

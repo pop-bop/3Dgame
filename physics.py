@@ -189,6 +189,8 @@ class RigidBody:
 
         self.mass = float(props.get("mass", 1.0))
         self.inv_mass = 1.0 / self.mass if self.mass > 0 else 0.0
+        self.local_vertices = None
+        self.is_cylinder = False
 
         if "half_extents" in props:
             self.half_extents = np.array(props["half_extents"], dtype=np.float64)
@@ -203,13 +205,42 @@ class RigidBody:
             verts = mesh.get("verts")
             if verts is None:
                 verts = np.array(mesh["tris"], dtype=np.float32)
-            flat = verts.reshape(-1, 3)
+            flat = verts.reshape(-1, 3).astype(np.float64)
             mn, mx = flat.min(axis=0), flat.max(axis=0)
-            self.half_extents = np.maximum((mx - mn) * 0.5, 0.05).astype(np.float64)
+            raw_half = (mx - mn) * 0.5
             self.center_offset = ((mx + mn) * 0.5).astype(np.float64)
+            if raw_half[1] < 1e-3:
+                # Flat horizontal surface (e.g. floor): keep top surface at mx[1]
+                self.center_offset[1] = mx[1] - 0.05
+            self.half_extents = np.maximum(raw_half, 0.05).astype(np.float64)
+
+            if self.inv_mass > 0 and np.all(raw_half > 1e-3):
+                rel = flat - self.center_offset
+                uniq = np.unique(np.round(rel, 5), axis=0)
+                if 8 < len(uniq) <= 256:
+                    # Exclude interior cap-center points on cylinders so only hull perimeter vertices remain
+                    radial_xz = np.hypot(uniq[:, 0], uniq[:, 2])
+                    max_r = radial_xz.max()
+                    if max_r > 1e-3 and np.any(radial_xz < max_r * 0.1):
+                        uniq = uniq[radial_xz >= max_r * 0.1]
+                        self.is_cylinder = True
+                    self.local_vertices = uniq
         else:
             self.half_extents = np.array([0.5, 0.5, 0.5], dtype=np.float64)
             self.center_offset = np.zeros(3, dtype=np.float64)
+
+        if self.local_vertices is None:
+            ex, ey, ez = self.half_extents
+            self.local_vertices = np.array([
+                [-ex, -ey, -ez],
+                [ ex, -ey, -ez],
+                [ ex,  ey, -ez],
+                [-ex,  ey, -ez],
+                [-ex, -ey,  ez],
+                [ ex, -ey,  ez],
+                [ ex,  ey,  ez],
+                [-ex,  ey,  ez],
+            ], dtype=np.float64)
 
         if self.inv_mass == 0:
             self.inertia_body = np.zeros((3, 3), dtype=np.float64)
@@ -222,6 +253,15 @@ class RigidBody:
             else:
                 self.inertia_body = np.diag(I).astype(np.float64)
                 self.inv_inertia_body = np.diag([1.0 / x if x > 0 else 0.0 for x in I]).astype(np.float64)
+        elif self.is_cylinder:
+            ex, ey, ez = self.half_extents
+            r = 0.5 * (ex + ez)
+            h = 2.0 * ey
+            I_yy = 0.5 * self.mass * (r ** 2)
+            I_xx = (1.0 / 12.0) * self.mass * (3.0 * (r ** 2) + (h ** 2))
+            I_zz = I_xx
+            self.inertia_body = np.diag([I_xx, I_yy, I_zz])
+            self.inv_inertia_body = np.diag([1.0 / I_xx, 1.0 / I_yy, 1.0 / I_zz])
         else:
             ex, ey, ez = self.half_extents
             I_xx = (1.0 / 3.0) * self.mass * (ey**2 + ez**2)
@@ -229,6 +269,66 @@ class RigidBody:
             I_zz = (1.0 / 3.0) * self.mass * (ex**2 + ey**2)
             self.inertia_body = np.diag([I_xx, I_yy, I_zz])
             self.inv_inertia_body = np.diag([1.0 / I_xx, 1.0 / I_yy, 1.0 / I_zz])
+
+        self.local_face_normals = np.eye(3, dtype=np.float64)
+        self.local_edge_dirs = np.eye(3, dtype=np.float64)
+        if mesh is not None:
+            verts_f = mesh.get("verts")
+            if verts_f is None:
+                verts_f = np.array(mesh["tris"], dtype=np.float32)
+            tris_f = verts_f.reshape(-1, 3, 3).astype(np.float64)
+            if len(tris_f) > 0:
+                fn = np.cross(tris_f[:, 1] - tris_f[:, 0], tris_f[:, 2] - tris_f[:, 0])
+                fl = np.linalg.norm(fn, axis=1, keepdims=True)
+                valid_fn = fl[:, 0] > 1e-10
+                if np.any(valid_fn):
+                    fn = fn[valid_fn] / fl[valid_fn]
+                    # Keep unique plane normal directions (up to sign)
+                    uniq_fn = []
+                    for n_vec in fn:
+                        if not any(abs(np.dot(n_vec, u_vec)) > 0.999 for u_vec in uniq_fn):
+                            uniq_fn.append(n_vec)
+                    if len(uniq_fn) <= 32:
+                        self.local_face_normals = np.array(uniq_fn, dtype=np.float64)
+
+        self.local_face_dists = np.max(np.abs(self.local_vertices @ self.local_face_normals.T), axis=0)
+
+        if self.is_cylinder:
+            edge_dirs = [[0.0, 1.0, 0.0]]
+            for n_vec in self.local_face_normals:
+                if abs(n_vec[1]) < 0.5:
+                    t_vec = np.array([-n_vec[2], 0.0, n_vec[0]], dtype=np.float64)
+                    tl = np.linalg.norm(t_vec)
+                    if tl > 1e-6:
+                        edge_dirs.append((t_vec / tl).tolist())
+            self.local_edge_dirs = np.array(edge_dirs, dtype=np.float64)
+
+        n_v = len(self.local_vertices)
+        hull_edges = []
+        if self.is_cylinder and n_v >= 16:
+            y_vals = self.local_vertices[:, 1]
+            bot_idx = np.where(y_vals < 0.0)[0]
+            top_idx = np.where(y_vals >= 0.0)[0]
+            if len(bot_idx) >= 3:
+                ang_b = np.arctan2(self.local_vertices[bot_idx, 2], self.local_vertices[bot_idx, 0])
+                bot_sorted = bot_idx[np.argsort(ang_b)]
+                for k in range(len(bot_sorted)):
+                    hull_edges.append([int(bot_sorted[k]), int(bot_sorted[(k + 1) % len(bot_sorted)])])
+            if len(top_idx) >= 3:
+                ang_t = np.arctan2(self.local_vertices[top_idx, 2], self.local_vertices[top_idx, 0])
+                top_sorted = top_idx[np.argsort(ang_t)]
+                for k in range(len(top_sorted)):
+                    hull_edges.append([int(top_sorted[k]), int(top_sorted[(k + 1) % len(top_sorted)])])
+                if len(bot_idx) == len(top_idx):
+                    for k in range(len(bot_sorted)):
+                        hull_edges.append([int(bot_sorted[k]), int(top_sorted[k])])
+        else:
+            for i_v in range(n_v):
+                for j_v in range(i_v + 1, n_v):
+                    diff = np.abs(self.local_vertices[i_v] - self.local_vertices[j_v])
+                    if np.sum(diff > 1e-4) == 1:
+                        hull_edges.append([i_v, j_v])
+        self.local_hull_edges = np.array(hull_edges, dtype=np.int32) if hull_edges else np.zeros((0, 2), dtype=np.int32)
 
         self.position = np.array(pos, dtype=np.float64)
         self.velocity = np.array(props.get("init_vel", [0.0, 0.0, 0.0]), dtype=np.float64)
@@ -275,12 +375,15 @@ class RigidBody:
         return rot_to_angles(self.rotation_matrix)
 
     def set_rotation_euler(self, angles):
+        old_center = self.get_center()
         self.rotation_matrix = rotation_matrix(angles).astype(np.float64)
+        self.position = old_center - self.rotation_matrix @ self.center_offset
 
     def _integrate_orientation(self, dt):
         omega = self.angular_velocity
         speed = np.linalg.norm(omega)
         if speed > 1e-10:
+            old_center = self.get_center()
             angle = speed * dt
             axis = omega / speed
             K = np.array([
@@ -296,21 +399,12 @@ class RigidBody:
             if np.linalg.det(self.rotation_matrix) < 0:
                 u[:, -1] *= -1
                 self.rotation_matrix = u @ vt
+            self.position = old_center - self.rotation_matrix @ self.center_offset
 
     def get_vertices(self):
-        ex, ey, ez = self.half_extents
-        local_corners = [
-            np.array([-ex, -ey, -ez]),
-            np.array([ ex, -ey, -ez]),
-            np.array([ ex,  ey, -ez]),
-            np.array([-ex,  ey, -ez]),
-            np.array([-ex, -ey,  ez]),
-            np.array([ ex, -ey,  ez]),
-            np.array([ ex,  ey,  ez]),
-            np.array([-ex,  ey,  ez]),
-        ]
         center = self.get_center()
-        return [center + self.rotation_matrix @ c for c in local_corners]
+        world_verts = (self.local_vertices @ self.rotation_matrix.T) + center
+        return list(world_verts)
 
     def update(self, dt):
         if dt <= 0 or self.inv_mass == 0:
@@ -334,63 +428,71 @@ class RigidBody:
         self.force_accumulator[:] = 0.0
         self.torque_accumulator[:] = 0.0
 
-        self.handle_ground_collisions()
+        self.handle_mesh_static_collisions()
+        if not mesh_statics:
+            self.handle_ground_collisions()
         self.handle_static_box_collisions()
 
+    def _resolve_plane_contact(self, normal, penetration, manifold_pts):
+        self.position += normal * penetration
+        shifted_pts = manifold_pts + normal * penetration
+        cop_pt = _compute_center_of_pressure(self.get_center(), shifted_pts, normal)
+        r = cop_pt - self.get_center()
+        cv = self.velocity + np.cross(self.angular_velocity, r)
+        vn = float(np.dot(cv, normal))
+
+        if vn < 0.0:
+            r_cross_n = np.cross(r, normal)
+            inv_I = self.get_inv_inertia_world()
+            rot_term = float(np.dot(r_cross_n, inv_I @ r_cross_n))
+            inv_mass_sum = self.inv_mass + rot_term
+            if inv_mass_sum > 1e-10:
+                e = self.restitution if abs(vn) > 0.25 else 0.0
+                j = -(1.0 + e) * vn / inv_mass_sum
+                impulse = normal * j
+                self.velocity += impulse * self.inv_mass
+                self.angular_velocity += inv_I @ np.cross(r, impulse)
+
+                # Coulomb friction impulse along the plane
+                cv_new = self.velocity + np.cross(self.angular_velocity, r)
+                tangent = cv_new - normal * np.dot(cv_new, normal)
+                t_sq = float(np.dot(tangent, tangent))
+                if t_sq > 1e-8:
+                    tangent = tangent / np.sqrt(t_sq)
+                    vt = float(np.dot(cv_new, tangent))
+                    r_cross_t = np.cross(r, tangent)
+                    inv_mass_tangent = self.inv_mass + float(np.dot(r_cross_t, inv_I @ r_cross_t))
+                    if inv_mass_tangent > 1e-10:
+                        jt = -vt / inv_mass_tangent
+                        if abs(jt) > abs(j) * self.static_friction:
+                            jt = -np.sign(vt) * abs(j) * self.dynamic_friction
+                        f_impulse = tangent * jt
+                        self.velocity += f_impulse * self.inv_mass
+                        self.angular_velocity += inv_I @ np.cross(r, f_impulse)
+
+        # Settle micro-vibrations only when supported underneath CoM on >= 2 contact points in a flat resting pose
+        r_tangent = r - normal * np.dot(r, normal)
+        flat_pose = (
+            not self.is_cylinder or
+            abs(np.dot(self.rotation_matrix[:, 1], normal)) > 0.98 or
+            abs(np.dot(self.rotation_matrix[:, 1], normal)) < 0.05
+        )
+        if flat_pose and len(manifold_pts) >= 2 and np.linalg.norm(r_tangent) < 0.12 and np.linalg.norm(self.angular_velocity) < 0.25:
+            vn_after = float(np.dot(self.velocity, normal))
+            if abs(vn_after) < 0.08 and penetration < 0.02:
+                self.velocity -= normal * vn_after
+                self.angular_velocity *= 0.85
+
     def handle_ground_collisions(self):
-        corners = self.get_vertices()
-        deepest_penetration = 0.0
-        collision_points = []
+        c_arr = (self.local_vertices @ self.rotation_matrix.T) + self.get_center()
         ground_y = 0.0
+        min_y = float(c_arr[:, 1].min())
 
-        for corner in corners:
-            val = corner[1]
-            if val < ground_y:
-                penetration = ground_y - val
-                if penetration > deepest_penetration:
-                    deepest_penetration = penetration
-                collision_points.append(corner)
-
-        if collision_points:
-            self.position[1] += deepest_penetration
-            avg_pt = np.mean(collision_points, axis=0)
-            r = avg_pt - self.get_center()
-            cv = self.velocity + np.cross(self.angular_velocity, r)
+        if min_y < ground_y:
+            deepest_penetration = ground_y - min_y
+            manifold_mask = c_arr[:, 1] <= (min_y + 0.002)
             normal = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            vn = np.dot(cv, normal)
-
-            if vn < 0:
-                r_cross_n = np.cross(r, normal)
-                inv_I = self.get_inv_inertia_world()
-                rot_term = np.dot(r_cross_n, inv_I @ r_cross_n)
-                inv_mass_sum = self.inv_mass + rot_term
-                if inv_mass_sum > 1e-10:
-                    e = self.restitution if abs(vn) > 0.2 else 0.0
-                    j = -(1.0 + e) * vn / inv_mass_sum
-                    impulse = normal * j
-                    self.velocity += impulse * self.inv_mass
-                    self.angular_velocity += inv_I @ np.cross(r, impulse)
-
-                    # Friction impulse
-                    cv_new = self.velocity + np.cross(self.angular_velocity, r)
-                    tangent = cv_new - normal * np.dot(cv_new, normal)
-                    t_sq = np.dot(tangent, tangent)
-                    if t_sq > 1e-6:
-                        tangent = tangent / np.sqrt(t_sq)
-                        vt = np.dot(cv_new, tangent)
-                        r_cross_t = np.cross(r, tangent)
-                        inv_mass_tangent = self.inv_mass + np.dot(r_cross_t, inv_I @ r_cross_t)
-                        if inv_mass_tangent > 1e-10:
-                            jt = -vt / inv_mass_tangent
-                            if abs(jt) > abs(j) * self.static_friction:
-                                jt = -np.sign(vt) * abs(j) * self.dynamic_friction
-                            f_impulse = tangent * jt
-                            self.velocity += f_impulse * self.inv_mass
-                            self.angular_velocity += inv_I @ np.cross(r, f_impulse)
-
-            if abs(self.velocity[1]) < 0.08 and deepest_penetration < 0.05:
-                self.velocity[1] = 0.0
-                self.angular_velocity *= 0.95
+            self._resolve_plane_contact(normal, deepest_penetration, c_arr[manifold_mask])
 
     def handle_static_box_collisions(self):
         if not statics:
@@ -420,32 +522,21 @@ class RigidBody:
                     else:
                         normal[axis] = 1.0
                         pen = d_mx[axis]
-
-                    self.position += normal * pen
-                    r = corner - self.get_center()
-                    cv = self.velocity + np.cross(self.angular_velocity, r)
-                    vn = np.dot(cv, normal)
-                    if vn < 0:
-                        r_cross_n = np.cross(r, normal)
-                        inv_I = self.get_inv_inertia_world()
-                        inv_mass_sum = self.inv_mass + np.dot(r_cross_n, inv_I @ r_cross_n)
-                        if inv_mass_sum > 1e-10:
-                            j = -(1.0 + self.restitution) * vn / inv_mass_sum
-                            imp = normal * j
-                            self.velocity += imp * self.inv_mass
-                            self.angular_velocity += inv_I @ np.cross(r, imp)
+                    self._resolve_plane_contact(normal, float(pen), np.array([corner]))
 
     def handle_mesh_static_collisions(self):
         if not mesh_statics or self.inv_mass == 0:
             return
 
-        corners = self.get_vertices()
-        c_arr = np.array(corners)
+        c_arr = (self.local_vertices @ self.rotation_matrix.T) + self.get_center()
         box_mn = c_arr.min(axis=0) - 0.05
         box_mx = c_arr.max(axis=0) + 0.05
 
+        # For each penetrating vertex, keep only its shallowest triangle plane contact
+        vert_best_plane = {}
+
         for name, ms in mesh_statics.items():
-            if name in rigid_bodies or name in static_bodies:
+            if name in rigid_bodies or ms.get("is_convex_solid", False):
                 continue
 
             v0 = ms["v0"]
@@ -464,41 +555,189 @@ class RigidBody:
 
             for idx in cand_indices:
                 norm = normals[idx]
-                p_d = plane_d[idx]
+                p_d = float(plane_d[idx])
+                signed_dists = c_arr @ norm - p_d
+
+                pen_indices = np.where((signed_dists < 0.0) & (signed_dists > -0.12))[0]
+                if len(pen_indices) == 0:
+                    continue
+
                 tri_v0 = v0[idx]
                 tri_v1 = v1[idx]
                 tri_v2 = v2[idx]
 
-                for corner in corners:
-                    signed_dist = np.dot(norm, corner) - p_d
-                    if -0.35 < signed_dist < 0.0:
-                        tri_pt = _closest_point_on_triangle(corner, tri_v0, tri_v1, tri_v2)
-                        dist = np.linalg.norm(corner - tri_pt)
-                        if dist < 0.35:
-                            pen = abs(signed_dist) + 0.002
-                            self.position += norm * pen
-                            r = corner - self.get_center()
-                            cv = self.velocity + np.cross(self.angular_velocity, r)
-                            vn = np.dot(cv, norm)
-                            if vn < 0:
-                                r_cross_n = np.cross(r, norm)
-                                inv_I = self.get_inv_inertia_world()
-                                denom = self.inv_mass + np.dot(r_cross_n, inv_I @ r_cross_n)
-                                if denom > 1e-10:
-                                    e = self.restitution if abs(vn) > 0.2 else 0.0
-                                    j = -(1.0 + e) * vn / denom
-                                    imp = norm * j
-                                    self.velocity += imp * self.inv_mass
-                                    self.angular_velocity += inv_I @ np.cross(r, imp)
+                for v_idx in pen_indices:
+                    corner = c_arr[v_idx]
+                    s_dist = float(signed_dists[v_idx])
+                    proj_pt = corner - norm * s_dist
+                    tri_pt = _closest_point_on_triangle(proj_pt, tri_v0, tri_v1, tri_v2)
+                    if np.linalg.norm(proj_pt - tri_pt) <= 0.02:
+                        pen = -s_dist
+                        key = (round(float(norm[0]), 3), round(float(norm[1]), 3), round(float(norm[2]), 3), round(p_d, 2))
+                        prev = vert_best_plane.get(v_idx)
+                        if prev is None or pen < prev[0]:
+                            vert_best_plane[v_idx] = (pen, key, norm, corner)
+
+        plane_contacts = {}
+        for v_idx, (pen, key, norm, corner) in vert_best_plane.items():
+            if key not in plane_contacts:
+                plane_contacts[key] = {"normal": norm, "verts": {}}
+            plane_contacts[key]["verts"][v_idx] = (pen, corner)
+
+        for info in plane_contacts.values():
+            vert_map = info["verts"]
+            if not vert_map:
+                continue
+            normal = info["normal"]
+            max_pen = max(v[0] for v in vert_map.values())
+            manifold_pts = np.array([v[1] for v in vert_map.values() if v[0] >= max_pen - 0.003], dtype=np.float64)
+            self._resolve_plane_contact(normal, max_pen, manifold_pts)
+
+
+def _clip_edges_to_body(p0_world, p1_world, body, tol=0.004):
+    """Vectorized Liang-Barsky clipping of 3D hull edge segments [p0, p1] against body's local convex planes."""
+    if len(p0_world) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    center = body.get_center()
+    R = body.rotation_matrix
+    p0 = (p0_world - center) @ R
+    p1 = (p1_world - center) @ R
+    dp = p1 - p0
+
+    N = body.local_face_normals          # (K, 3)
+    limits = body.local_face_dists + tol # (K,)
+
+    x0 = p0 @ N.T                        # (E, K)
+    dx = dp @ N.T                        # (E, K)
+
+    parallel = np.abs(dx) < 1e-10
+    outside_parallel = parallel & (np.abs(x0) > limits[None, :])
+
+    safe_dx = np.where(parallel, 1.0, dx)
+    t1 = (-limits[None, :] - x0) / safe_dx
+    t2 = ( limits[None, :] - x0) / safe_dx
+
+    t_enter = np.where(parallel, 0.0, np.minimum(t1, t2))
+    t_exit  = np.where(parallel, 1.0, np.maximum(t1, t2))
+    t_enter = np.where(outside_parallel, 2.0, t_enter)
+    t_exit  = np.where(outside_parallel, -1.0, t_exit)
+
+    t_min = np.maximum(0.0, np.max(t_enter, axis=1))
+    t_max = np.minimum(1.0, np.min(t_exit, axis=1))
+
+    valid = t_min <= t_max + 1e-7
+    if not np.any(valid):
+        return np.empty((0, 3), dtype=np.float64)
+
+    v_p0 = p0_world[valid]
+    v_dp = (p1_world - p0_world)[valid]
+    v_tmin = np.clip(t_min[valid], 0.0, 1.0)[:, None]
+    v_tmax = np.clip(t_max[valid], 0.0, 1.0)[:, None]
+
+    pts_start = v_p0 + v_tmin * v_dp
+    pts_end   = v_p0 + v_tmax * v_dp
+    return np.vstack((pts_start, pts_end))
+
+
+def _closest_point_between_features(pts1, pts2):
+    """Finds the closest midpoint between two vertex/segment features in 3D."""
+    if len(pts1) == 1 and len(pts2) == 1:
+        return 0.5 * (pts1[0] + pts2[0])
+    if len(pts1) == 1 and len(pts2) >= 2:
+        p = pts1[0]
+        d = pts2 - pts2[0]
+        end_idx = int(np.argmax(np.einsum("ij,ij->i", d, d)))
+        q = _closest_point_on_segment(p, pts2[0], pts2[end_idx])
+        return 0.5 * (p + q)
+    if len(pts2) == 1 and len(pts1) >= 2:
+        q = pts2[0]
+        d = pts1 - pts1[0]
+        end_idx = int(np.argmax(np.einsum("ij,ij->i", d, d)))
+        p = _closest_point_on_segment(q, pts1[0], pts1[end_idx])
+        return 0.5 * (p + q)
+
+    # Segment vs segment
+    d1_all = pts1 - pts1[0]
+    a0, a1 = pts1[0], pts1[int(np.argmax(np.einsum("ij,ij->i", d1_all, d1_all)))]
+    d2_all = pts2 - pts2[0]
+    b0, b1 = pts2[0], pts2[int(np.argmax(np.einsum("ij,ij->i", d2_all, d2_all)))]
+
+    u = a1 - a0
+    v = b1 - b0
+    w = a0 - b0
+    a = float(np.dot(u, u))
+    b = float(np.dot(u, v))
+    c = float(np.dot(v, v))
+    d = float(np.dot(u, w))
+    e = float(np.dot(v, w))
+    denom = a * c - b * b
+
+    if denom > 1e-8:
+        s = np.clip((b * e - c * d) / denom, 0.0, 1.0)
+    else:
+        s = 0.5
+    p_seg1 = a0 + s * u
+    p_seg2 = _closest_point_on_segment(p_seg1, b0, b1)
+    p_seg1 = _closest_point_on_segment(p_seg2, a0, a1)
+    return 0.5 * (p_seg1 + p_seg2)
+
+
+def _compute_center_of_pressure(body_center, manifold_pts, normal):
+    """Finds the physical Center of Pressure: closest point in the convex hull of manifold_pts to the projected CoM."""
+    if len(manifold_pts) == 0:
+        return body_center.copy()
+    if len(manifold_pts) == 1:
+        return manifold_pts[0].copy()
+
+    avg_pt = manifold_pts.mean(axis=0)
+    p_com = body_center + normal * np.dot(avg_pt - body_center, normal)
+
+    offsets = (manifold_pts - avg_pt) @ normal
+    plane_pts = manifold_pts - np.outer(offsets, normal)
+    uniq = np.unique(np.round(plane_pts, 4), axis=0)
+
+    if len(uniq) == 1:
+        return uniq[0]
+    if len(uniq) == 2:
+        return _closest_point_on_segment(p_com, uniq[0], uniq[1])
+
+    centroid = uniq.mean(axis=0)
+    rel = uniq - centroid
+    dists_sq = np.einsum("ij,ij->i", rel, rel)
+    max_idx = int(np.argmax(dists_sq))
+    if dists_sq[max_idx] < 1e-8:
+        return centroid
+
+    u = rel[max_idx] / np.sqrt(dists_sq[max_idx])
+    v = np.cross(normal, u)
+    v_len = np.linalg.norm(v)
+    if v_len < 1e-8:
+        return _closest_point_on_segment(p_com, uniq[0], uniq[max_idx])
+    v = v / v_len
+
+    angles = np.arctan2(rel @ v, rel @ u)
+    ordered = uniq[np.argsort(angles)]
+    m = len(ordered)
+
+    best_pt = centroid
+    best_dist_sq = float('inf')
+    for k in range(m):
+        cand = _closest_point_on_triangle(p_com, centroid, ordered[k], ordered[(k + 1) % m])
+        diff = p_com - cand
+        d_sq = float(np.dot(diff, diff))
+        if d_sq < best_dist_sq:
+            best_dist_sq = d_sq
+            best_pt = cand
+            if d_sq < 1e-10:
+                break
+    return best_pt
 
 
 def check_box_collision(b1, b2):
-    """Separating Axis Theorem (SAT) detection between two oriented rigid bodies."""
-    v1 = b1.get_vertices()
-    v2 = b2.get_vertices()
-
-    c1_mat = np.array(v1)
-    c2_mat = np.array(v2)
+    """3D Convex SAT with plane normals, rim/box edge cross products, and Liang-Barsky 3D intersection manifold."""
+    c1_mat = (b1.local_vertices @ b1.rotation_matrix.T) + b1.get_center()
+    c2_mat = (b2.local_vertices @ b2.rotation_matrix.T) + b2.get_center()
 
     min1_aabb = c1_mat.min(axis=0)
     max1_aabb = c1_mat.max(axis=0)
@@ -511,59 +750,134 @@ def check_box_collision(b1, b2):
     R1 = b1.rotation_matrix
     R2 = b2.rotation_matrix
 
-    axes = []
-    for i in range(3):
-        axes.append(R1[:, i])
-    for i in range(3):
-        axes.append(R2[:, i])
-    for i in range(3):
-        for j in range(3):
-            c = np.cross(R1[:, i], R2[:, j])
-            l = np.linalg.norm(c)
-            if l > 1e-5:
-                axes.append(c / l)
+    b1_normals = b1.local_face_normals @ R1.T
+    b2_normals = b2.local_face_normals @ R2.T
+    b1_edges = b1.local_edge_dirs @ R1.T
+    b2_edges = b2.local_edge_dirs @ R2.T
 
-    min_overlap = float('inf')
-    collision_normal = None
-    normal_from_b1 = True
+    face_axes = []
+    if b2.inv_mass == 0 and b1.inv_mass > 0:
+        for n_vec in b2_normals:
+            face_axes.append((n_vec, False))
+        for n_vec in b1_normals:
+            face_axes.append((n_vec, True))
+    else:
+        for n_vec in b1_normals:
+            face_axes.append((n_vec, True))
+        for n_vec in b2_normals:
+            face_axes.append((n_vec, False))
 
-    for idx, axis in enumerate(axes):
+    min_face_overlap = float('inf')
+    face_normal = None
+    face_from_b1 = True
+
+    for axis, from_b1 in face_axes:
         p1 = c1_mat @ axis
         p2 = c2_mat @ axis
         min1, max1 = p1.min(), p1.max()
         min2, max2 = p2.min(), p2.max()
-
         if max1 < min2 or max2 < min1:
             return False
-
         overlap = min(max1, max2) - max(min1, min2)
-        if overlap < min_overlap:
-            min_overlap = overlap
-            collision_normal = axis
-            normal_from_b1 = (idx < 3)
+        if overlap < min_face_overlap - 1e-5:
+            min_face_overlap = overlap
+            face_normal = axis
+            face_from_b1 = from_b1
+
+    min_edge_overlap = float('inf')
+    edge_normal = None
+
+    for e1 in b1_edges:
+        for e2 in b2_edges:
+            c = np.cross(e1, e2)
+            l = np.linalg.norm(c)
+            if l > 1e-3:
+                axis = c / l
+                p1 = c1_mat @ axis
+                p2 = c2_mat @ axis
+                min1, max1 = p1.min(), p1.max()
+                min2, max2 = p2.min(), p2.max()
+                if max1 < min2 or max2 < min1:
+                    return False
+                overlap = min(max1, max2) - max(min1, min2)
+                if overlap < min_edge_overlap - 1e-5:
+                    min_edge_overlap = overlap
+                    edge_normal = axis
+
+    if edge_normal is not None and min_edge_overlap < min_face_overlap * 0.98 - 5e-5:
+        min_overlap = min_edge_overlap
+        collision_normal = edge_normal
+        normal_from_b1 = False
+        from_face = False
+    else:
+        min_overlap = min_face_overlap
+        collision_normal = face_normal
+        normal_from_b1 = face_from_b1
+        from_face = True
 
     if collision_normal is None:
         return False
 
-    if np.dot(b2.get_center() - b1.get_center(), collision_normal) < 0:
+    p1 = c1_mat @ collision_normal
+    p2 = c2_mat @ collision_normal
+    mid1 = 0.5 * (p1.min() + p1.max())
+    mid2 = 0.5 * (p2.min() + p2.max())
+    if mid2 < mid1:
         collision_normal = -collision_normal
+        p1 = -p1
+        p2 = -p2
 
-    if normal_from_b1:
-        projs = [np.dot(v, collision_normal) for v in v2]
-        min_p = min(projs)
-        contact_pts = [v for v, p in zip(v2, projs) if abs(p - min_p) < 1e-3]
-        contact_point = np.mean(contact_pts, axis=0)
+    max_p1 = float(p1.max())
+    min_p2 = float(p2.min())
+
+    e1_idx = b1.local_hull_edges
+    e2_idx = b2.local_hull_edges
+    clipped1 = _clip_edges_to_body(c1_mat[e1_idx[:, 0]], c1_mat[e1_idx[:, 1]], b2, tol=0.006) if len(e1_idx) > 0 else np.empty((0, 3), dtype=np.float64)
+    clipped2 = _clip_edges_to_body(c2_mat[e2_idx[:, 0]], c2_mat[e2_idx[:, 1]], b1, tol=0.006) if len(e2_idx) > 0 else np.empty((0, 3), dtype=np.float64)
+
+    if len(clipped1) == 0 and len(clipped2) == 0:
+        return False
+
+    deep1 = np.empty((0, 3), dtype=np.float64)
+    if len(clipped1) > 0:
+        cp1 = clipped1 @ collision_normal
+        c1_max = float(cp1.max())
+        if c1_max >= min_p2 - 0.008:
+            deep1 = clipped1[cp1 >= c1_max - 0.005]
+            if from_face and not normal_from_b1:
+                clipped_pen = c1_max - min_p2
+                if 0.0 < clipped_pen < min_overlap:
+                    min_overlap = clipped_pen
+
+    deep2 = np.empty((0, 3), dtype=np.float64)
+    if len(clipped2) > 0:
+        cp2 = clipped2 @ collision_normal
+        c2_min = float(cp2.min())
+        if c2_min <= max_p1 + 0.008:
+            deep2 = clipped2[cp2 <= c2_min + 0.005]
+            if from_face and normal_from_b1:
+                clipped_pen = max_p1 - c2_min
+                if 0.0 < clipped_pen < min_overlap:
+                    min_overlap = clipped_pen
+
+    if len(deep1) > 0 and len(deep2) > 0:
+        manifold_pts = np.vstack((deep1, deep2))
+    elif len(deep1) > 0:
+        manifold_pts = deep1
+    elif len(deep2) > 0:
+        manifold_pts = deep2
     else:
-        projs = [np.dot(v, collision_normal) for v in v1]
-        max_p = max(projs)
-        contact_pts = [v for v, p in zip(v1, projs) if abs(p - max_p) < 1e-3]
-        contact_point = np.mean(contact_pts, axis=0)
+        all_clipped = np.vstack([arr for arr in (clipped1, clipped2) if len(arr) > 0])
+        manifold_pts = all_clipped
 
-    resolve_rigid_collision(b1, b2, collision_normal, min_overlap, contact_point)
+    ref_center = b1.get_center() if b1.inv_mass > 0 else b2.get_center()
+    contact_point = _compute_center_of_pressure(ref_center, manifold_pts, collision_normal)
+
+    resolve_rigid_collision(b1, b2, collision_normal, min_overlap, contact_point, manifold_pts)
     return True
 
 
-def resolve_rigid_collision(b1, b2, normal, overlap, contact_point):
+def resolve_rigid_collision(b1, b2, normal, overlap, contact_point, manifold_pts=None):
     total_inv_mass = b1.inv_mass + b2.inv_mass
     if total_inv_mass <= 0:
         return
@@ -581,64 +895,75 @@ def resolve_rigid_collision(b1, b2, normal, overlap, contact_point):
     relative_velocity = v2_contact - v1_contact
 
     vn = np.dot(relative_velocity, normal)
-    if vn > 0:
-        return
+    if vn < 0:
+        inv_I1 = b1.get_inv_inertia_world()
+        inv_I2 = b2.get_inv_inertia_world()
 
-    inv_I1 = b1.get_inv_inertia_world()
-    inv_I2 = b2.get_inv_inertia_world()
+        r1_cross_n = np.cross(r1, normal)
+        r2_cross_n = np.cross(r2, normal)
 
-    r1_cross_n = np.cross(r1, normal)
-    r2_cross_n = np.cross(r2, normal)
+        rot_term1 = np.dot(r1_cross_n, inv_I1 @ r1_cross_n)
+        rot_term2 = np.dot(r2_cross_n, inv_I2 @ r2_cross_n)
 
-    rot_term1 = np.dot(r1_cross_n, inv_I1 @ r1_cross_n)
-    rot_term2 = np.dot(r2_cross_n, inv_I2 @ r2_cross_n)
+        e = min(b1.restitution, b2.restitution)
+        if abs(vn) < 0.25:
+            e = 0.0
 
-    e = min(b1.restitution, b2.restitution)
-    if abs(vn) < 0.2:
-        e = 0.0
+        inv_mass_sum = total_inv_mass + rot_term1 + rot_term2
+        if inv_mass_sum > 1e-10:
+            j = -(1.0 + e) * vn / inv_mass_sum
+            impulse = normal * j
 
-    inv_mass_sum = total_inv_mass + rot_term1 + rot_term2
-    if inv_mass_sum < 1e-10:
-        return
+            b1.velocity -= impulse * b1.inv_mass
+            b1.angular_velocity -= inv_I1 @ np.cross(r1, impulse)
+            b2.velocity += impulse * b2.inv_mass
+            b2.angular_velocity += inv_I2 @ np.cross(r2, impulse)
 
-    j = -(1.0 + e) * vn / inv_mass_sum
-    impulse = normal * j
+            # Friction Impulse
+            v1_contact = b1.velocity + np.cross(b1.angular_velocity, r1)
+            v2_contact = b2.velocity + np.cross(b2.angular_velocity, r2)
+            relative_velocity = v2_contact - v1_contact
 
-    b1.velocity -= impulse * b1.inv_mass
-    b1.angular_velocity -= inv_I1 @ np.cross(r1, impulse)
-    b2.velocity += impulse * b2.inv_mass
-    b2.angular_velocity += inv_I2 @ np.cross(r2, impulse)
+            tangent = relative_velocity - (normal * np.dot(relative_velocity, normal))
+            tangent_sq = np.dot(tangent, tangent)
+            if tangent_sq > 1e-8:
+                tangent = tangent / np.sqrt(tangent_sq)
+                vt = np.dot(relative_velocity, tangent)
 
-    # Friction Impulse
-    v1_contact = b1.velocity + np.cross(b1.angular_velocity, r1)
-    v2_contact = b2.velocity + np.cross(b2.angular_velocity, r2)
-    relative_velocity = v2_contact - v1_contact
+                r1_cross_t = np.cross(r1, tangent)
+                r2_cross_t = np.cross(r2, tangent)
+                rot_term1_t = np.dot(r1_cross_t, inv_I1 @ r1_cross_t)
+                rot_term2_t = np.dot(r2_cross_t, inv_I2 @ r2_cross_t)
 
-    tangent = relative_velocity - (normal * np.dot(relative_velocity, normal))
-    tangent_sq = np.dot(tangent, tangent)
-    if tangent_sq > 1e-6:
-        tangent = tangent / np.sqrt(tangent_sq)
-        vt = np.dot(relative_velocity, tangent)
+                inv_mass_tangent = total_inv_mass + rot_term1_t + rot_term2_t
+                if inv_mass_tangent > 1e-10:
+                    jt = -vt / inv_mass_tangent
+                    mu = (b1.static_friction + b2.static_friction) / 2.0
 
-        r1_cross_t = np.cross(r1, tangent)
-        r2_cross_t = np.cross(r2, tangent)
-        rot_term1_t = np.dot(r1_cross_t, inv_I1 @ r1_cross_t)
-        rot_term2_t = np.dot(r2_cross_t, inv_I2 @ r2_cross_t)
+                    if abs(jt) > abs(j) * mu:
+                        dynamic_mu = (b1.dynamic_friction + b2.dynamic_friction) / 2.0
+                        jt = -abs(j) * dynamic_mu if vt > 0 else abs(j) * dynamic_mu
 
-        inv_mass_tangent = total_inv_mass + rot_term1_t + rot_term2_t
-        if inv_mass_tangent > 1e-10:
-            jt = -vt / inv_mass_tangent
-            mu = (b1.static_friction + b2.static_friction) / 2.0
+                    f_impulse = tangent * jt
+                    b1.velocity -= f_impulse * b1.inv_mass
+                    b1.angular_velocity -= inv_I1 @ np.cross(r1, f_impulse)
+                    b2.velocity += f_impulse * b2.inv_mass
+                    b2.angular_velocity += inv_I2 @ np.cross(r2, f_impulse)
 
-            if abs(jt) > abs(j) * mu:
-                dynamic_mu = (b1.dynamic_friction + b2.dynamic_friction) / 2.0
-                jt = -abs(j) * dynamic_mu if vt > 0 else abs(j) * dynamic_mu
-
-            f_impulse = tangent * jt
-            b1.velocity -= f_impulse * b1.inv_mass
-            b1.angular_velocity -= inv_I1 @ np.cross(r1, f_impulse)
-            b2.velocity += f_impulse * b2.inv_mass
-            b2.angular_velocity += inv_I2 @ np.cross(r2, f_impulse)
+    # Settle micro-vibrations when b1 rests on static b2 in a flat equilibrium pose
+    if b2.inv_mass == 0 and manifold_pts is not None and len(manifold_pts) >= 2:
+        outward_n = -normal
+        r1_tangent = r1 - outward_n * np.dot(r1, outward_n)
+        flat_pose = (
+            not b1.is_cylinder or
+            abs(np.dot(b1.rotation_matrix[:, 1], outward_n)) > 0.98 or
+            abs(np.dot(b1.rotation_matrix[:, 1], outward_n)) < 0.05
+        )
+        if flat_pose and np.linalg.norm(r1_tangent) < 0.12 and np.linalg.norm(b1.angular_velocity) < 0.25:
+            vn_after = float(np.dot(b1.velocity, outward_n))
+            if abs(vn_after) < 0.08 and overlap < 0.02:
+                b1.velocity -= outward_n * vn_after
+                b1.angular_velocity *= 0.85
 
 
 def add_rigid_body(name, mesh, pos, rot_deg=None, physics_file=None, props=None, root="."):
@@ -685,13 +1010,11 @@ def update_rigid_bodies(dt):
                 b2 = rigid_bodies[dyn_keys[j]]
                 check_box_collision(b1, b2)
 
-        # 3. Dynamic vs Static SAT collisions (walls and static objects)
+        # 3. Dynamic vs Static convex SAT & plane-normal collisions
         for b_dyn in rigid_bodies.values():
             for s_key in stat_keys:
-                b_stat = static_bodies[s_key]
-                check_box_collision(b_dyn, b_stat)
-
-            # 4. Dynamic vs Mesh-Static triangle collisions (for any non-box triangles)
+                if s_key not in mesh_statics or mesh_statics[s_key].get("is_convex_solid", False):
+                    check_box_collision(b_dyn, static_bodies[s_key])
             b_dyn.handle_mesh_static_collisions()
 
     # Sync collision mesh for player interaction
@@ -801,13 +1124,19 @@ def add_mesh_static(name, mesh, pos, rot_deg=None):
     v2      = v2[valid]
 
     plane_d = np.einsum("ij,ij->i", normals, v0)
+    all_pts = triangles.reshape(-1, 3)
+    is_convex_solid = bool(
+        len(normals) >= 4 and
+        np.all((all_pts @ normals.T - plane_d[None, :]) <= 1e-3)
+    )
 
     mesh_statics[name] = {
-        "normals": normals,
-        "plane_d": plane_d,
-        "v0":      v0,
-        "v1":      v1,
-        "v2":      v2,
+        "normals":         normals,
+        "plane_d":         plane_d,
+        "v0":              v0,
+        "v1":              v1,
+        "v2":              v2,
+        "is_convex_solid": is_convex_solid,
     }
 
     # Automatically register static collision body for OBB SAT
